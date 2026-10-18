@@ -573,6 +573,17 @@ class KontekstSql:
                 wynik.append((rodzaj, pewne, m.group(2)))
         return wynik
 
+    def parametr_do_kolumny_numeru(self):
+        """Czy któryś parametr (?) jest zapisywany/porównywany z kolumną o nazwie numeru dokumentu."""
+        for m in re.finditer(r"(%s)\s*(?:=|like|ilike)\s*\?" % _CHAIN_PATTERN, self.skel, re.I):
+            if nazwa_identyfikatora([m.group(1).split(".")[-1]]):
+                return True
+        for m in re.finditer(r"\?", self.skel):
+            kol = _kolumna_insertu(self.skel, m.start())
+            if kol and nazwa_identyfikatora([kol]):
+                return True
+        return False
+
     def czy_sql_z_czasem(self):
         if _TIME_RE.search(self.skel):
             return True
@@ -649,7 +660,7 @@ def _pewnosc(kolumny_rodzaj):
     return "likely" if any(p for _, p, _ in kolumny_rodzaj) else "uncertain"
 
 
-_NAZWA_ID = re.compile(r"numer|(?<![a-z])nr(?![a-z])|number|seq|prefix|numeracja|invoice|order_no", re.I)
+_NAZWA_ID = re.compile(r"numer|(?<![a-z])nr(?![a-z])|number|seq|seri[ae]|prefix|numeracja|invoice|order_no", re.I)
 _PREFIKS_DOK = re.compile(r"[A-Z]{1,8}[/\-_.]")
 
 
@@ -921,6 +932,7 @@ _NAZWA_NUMERU = re.compile(r"numer|number|nr(?![a-z])|(?<![a-z])no(?![a-z])|_no\
 class InfoCzas:
     rodzaj: str
     naiwny: bool
+    syntetyczny: bool = False  # źródło czasu odtworzone z SQL (SELECT CURRENT_DATE), nie wywołanie Pythona
 
 
 class Zakres:
@@ -956,6 +968,12 @@ def _kw(call, nazwa):
         if k.arg == nazwa:
             return k.value
     return None
+
+
+def _z_parametru(node):
+    """Wyrażenie czyta wartość z żądania/słownika: ``x.get(...)`` lub ``x[...]``."""
+    return any((isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "get")
+               or isinstance(n, ast.Subscript) for n in ast.walk(node))
 
 
 def _stala_tekst(node):
@@ -994,6 +1012,7 @@ class AnalizatorModulu:
         self.numeracja_zdegradowane = 0
         self.trafione = set()
         self.domyslne = set()
+        self._num_linie = set()
         self.wyniki_ostrzezenia = []
         self._przygotuj()
 
@@ -1238,6 +1257,25 @@ class AnalizatorModulu:
                 return list(w[1])
         return []
 
+    def rejestruj_zrodlo_sql(self, call, sc):
+        """``SELECT CURRENT_DATE`` / ``SELECT now()`` bez strefy: wynik zapytania jest naiwnym "teraz"."""
+        if id(call) in self.czas:
+            return
+        arg = call.args[0] if call.args else _kw(call, "sql") or _kw(call, "query")
+        res = self.sql_text(arg, sc) if arg is not None else None
+        if not res:
+            return
+        _, skel = blank_sql(res[0])
+        if not re.match(r"[\s(]*select\b", skel, re.I):
+            return
+        od = re.search(r"\bfrom\b", skel, re.I)
+        granica = od.start() if od else len(skel)
+        for rx in (_CUR_DATE_RE, _NOW_RE):
+            for m in rx.finditer(skel, 0, granica):
+                if not _strefa_jawna(skel, m.start(), m.end()):
+                    self.czas[id(call)] = InfoCzas("sqlnow", True, True)
+                    return
+
     def czasy_w(self, wyr, sc):
         ids = set()
         for n in ast.walk(wyr):
@@ -1264,6 +1302,9 @@ class AnalizatorModulu:
             cele, wartosc, aug = [st.target], st.value, False
         if wartosc is None:
             return
+        for n in ast.walk(wartosc):
+            if isinstance(n, ast.Call) and self.helper_sql(n):
+                self.rejestruj_zrodlo_sql(n, sc)
         nazwy = [n.id for c in cele for n in ast.walk(c) if isinstance(n, ast.Name)]
         proste = [c.id for c in cele if isinstance(c, ast.Name)]
         wart = self.sql_value(wartosc, sc)
@@ -1283,13 +1324,18 @@ class AnalizatorModulu:
                     sc.env.pop(k, None)
         czasy = self.czasy_w(wartosc, sc)
         skaz = self.skazone(wartosc, sc)
-        if isinstance(wartosc, ast.Call) and isinstance(wartosc.func, ast.Attribute) and wartosc.func.attr == "get":
+        if _z_parametru(wartosc) and not czasy:
             sc.getnames.update(proste)
-        elif isinstance(wartosc, ast.BoolOp) and isinstance(wartosc.op, ast.Or) and len(wartosc.values) > 1 \
-                and isinstance(wartosc.values[0], ast.Call) and isinstance(wartosc.values[0].func, ast.Attribute) \
-                and wartosc.values[0].func.attr == "get":
-            for v in wartosc.values[1:]:
-                self.domyslne |= self.czasy_w(v, sc)
+        for n in ast.walk(wartosc):  # ``a.get(..) or <teraz>`` oraz ``a[..] if .. else <teraz>``
+            if isinstance(n, ast.BoolOp) and isinstance(n.op, ast.Or):
+                for i, v in enumerate(n.values[1:], 1):
+                    if any(_z_parametru(w) for w in n.values[:i]):
+                        self.domyslne |= self.czasy_w(v, sc)
+            elif isinstance(n, ast.IfExp):
+                if _z_parametru(n.body):
+                    self.domyslne |= self.czasy_w(n.orelse, sc)
+                if _z_parametru(n.orelse):
+                    self.domyslne |= self.czasy_w(n.body, sc)
         for nm in nazwy:
             if aug:
                 sc.deps[nm] = sc.deps.get(nm, set()) | czasy
@@ -1304,18 +1350,24 @@ class AnalizatorModulu:
 
     def on_if(self, st, sc):
         """``if not x: x = <naiwne teraz>`` gdy x pochodzi z ``.get(...)`` - wartość domyślna parametru."""
-        t = st.test
-        nazwa = None
-        if isinstance(t, ast.UnaryOp) and isinstance(t.op, ast.Not) and isinstance(t.operand, ast.Name):
-            nazwa = t.operand.id
-        elif isinstance(t, ast.Compare) and isinstance(t.left, ast.Name) and len(t.comparators) == 1 \
-                and isinstance(t.comparators[0], ast.Constant) and t.comparators[0].value in (None, "") \
-                and isinstance(t.ops[0], (ast.Is, ast.Eq)):
-            nazwa = t.left.id
-        if nazwa and nazwa in sc.getnames:
-            for b in st.body:
-                if isinstance(b, ast.Assign) and any(isinstance(x, ast.Name) and x.id == nazwa for x in b.targets):
-                    self.domyslne |= self.czasy_w(b.value, sc)
+        puste, niepuste = set(), set()
+        for t in (st.test.values if isinstance(st.test, ast.BoolOp) else [st.test]):
+            if isinstance(t, ast.UnaryOp) and isinstance(t.op, ast.Not) and isinstance(t.operand, ast.Name):
+                puste.add(t.operand.id)
+            elif isinstance(t, ast.Compare) and isinstance(t.left, ast.Name) and len(t.comparators) == 1 \
+                    and isinstance(t.comparators[0], ast.Constant) and t.comparators[0].value in (None, ""):
+                if isinstance(t.ops[0], (ast.Is, ast.Eq)):
+                    puste.add(t.left.id)
+                else:
+                    niepuste.add(t.left.id)
+            elif isinstance(t, ast.Name):
+                niepuste.add(t.id)
+        for nazwy, galaz in ((puste, st.body), (niepuste, st.orelse)):
+            for nm in nazwy & sc.getnames:
+                for b in galaz:
+                    for a in ast.walk(b):
+                        if isinstance(a, ast.Assign) and any(isinstance(x, ast.Name) and x.id == nm for x in a.targets):
+                            self.domyslne |= self.czasy_w(a.value, sc)
 
     def on_expr_stmt(self, st, sc):
         v = st.value
@@ -1383,6 +1435,8 @@ class AnalizatorModulu:
         if helper:
             self.on_sql_call(call, sc, helper)
         self.sprawdz_harmonogram(call, sc)
+        if isinstance(call.func, ast.Attribute) and call.func.attr == "format":
+            self.numeracja_format_call(call, sc)
         if isinstance(call.func, ast.Attribute) and call.func.attr == "strftime" and call.args:
             fmt = _stala_tekst(call.args[0])
             ids = self._naiwne(self.czasy_w(call.func.value, sc))
@@ -1415,6 +1469,8 @@ class AnalizatorModulu:
                 self.dodaj(kat, sc.qual, linia, helper, ctx.snippet(s, e), pew)
         elif len(call.args) < 2 and _kw(call, "params") is None and _kw(call, "vars") is None:
             return
+        if ctx is not None:
+            self.numeracja_parametru_sql(call, ctx, sc)
         ids = set()
         for a in list(call.args) + [k.value for k in call.keywords]:
             ids |= self.czasy_w(a, sc)
@@ -1444,6 +1500,8 @@ class AnalizatorModulu:
             self.uzycie_db[i] = self.uzycie_db.get(i, False) or pewna
 
     def on_binop(self, b, sc):
+        if isinstance(b.op, (ast.Add, ast.Mod)):
+            self.numeracja_binop(b, sc)
         if not isinstance(b.op, (ast.Add, ast.Sub)):
             return
         for a, c in ((b.left, b.right), (b.right, b.left)):
@@ -1468,13 +1526,67 @@ class AnalizatorModulu:
     def _naiwne(self, ids):
         return sorted(i for i in ids if self.czas[i].naiwny)
 
+    def kontekst_numeru(self, sc, prefiks):
+        return bool(prefiks or nazwa_identyfikatora(list(self.hint) + [sc.qual.split(".")[-1].lower()]))
+
     def numeracja_formatu(self, fmt, sc, prefiks):
-        """-> (stary, nowy): szeroka reguła z rundy 1 i zawężona (identyfikator dokumentu)."""
-        if not (re.search(r"%[Yy]", fmt) and re.search(r"%[mbB]", fmt)):
+        """-> (stary, nowy): szeroka reguła z rundy 1 i zawężona (identyfikator dokumentu).
+
+        Nowa reguła: rok LUB miesiąc w formacie, ale tylko w kontekście numeru (prefiks / nazwa).
+        """
+        rok, mies = re.search(r"%[Yy]", fmt), re.search(r"%[mbB]", fmt)
+        if not (rok or mies):
             return False, False
         nazwy = list(self.hint) + [sc.qual.split(".")[-1].lower()]
-        stary = (not re.search(r"%[dHMSjaAIpf]", fmt)) or any(_NAZWA_NUMERU.search(x) for x in nazwy)
-        return stary, bool(prefiks or nazwa_identyfikatora(nazwy))
+        stary = bool(rok and mies) and ((not re.search(r"%[dHMSjaAIpf]", fmt))
+                                        or any(_NAZWA_NUMERU.search(x) for x in nazwy))
+        return stary, self.kontekst_numeru(sc, prefiks)
+
+    def rok_mies(self, node, sc):
+        """Naiwne źródła czasu (także przez zmienną), których rok/miesiąc (.year/.month) użyto w ``node``."""
+        ids = set()
+        for n in ast.walk(node):
+            if isinstance(n, ast.Attribute) and n.attr in ("year", "month"):
+                ids |= set(self._naiwne(self.czasy_w(n.value, sc)))
+        return ids
+
+    def numeracja_binop(self, b, sc):
+        """``"FV/" + str(d.year)``, ``"FV/%d" % d.year``: prefiks dokumentu + rok/miesiąc zmiennej czasowej."""
+        for stala, reszta in ((b.left, b.right), (b.right, b.left)):
+            if isinstance(b.op, ast.Mod) and stala is not b.left:
+                continue
+            ma_prefiks = isinstance(stala, ast.Constant) and isinstance(stala.value, str) \
+                and bool(_PREFIKS_DOK.match(stala.value))
+            ids = self.rok_mies(reszta, sc)
+            if ids and self.kontekst_numeru(sc, ma_prefiks):
+                self.zglos_numeracje(sorted(ids), b, sc)
+                return
+
+    def numeracja_format_call(self, call, sc):
+        """``"FV/{}/{}".format(d.year, seq)`` oraz ``"FV/{:%Y}".format(d)``."""
+        tpl = call.func.value
+        if not (isinstance(tpl, ast.Constant) and isinstance(tpl.value, str)):
+            return
+        ids = set()
+        for a in list(call.args) + [k.value for k in call.keywords]:
+            ids |= self.rok_mies(a, sc)
+            if re.search(r"%[YymbB]", tpl.value):
+                ids |= set(self._naiwne(self.czasy_w(a, sc)))
+        if ids and self.kontekst_numeru(sc, bool(_PREFIKS_DOK.match(tpl.value))):
+            self.zglos_numeracje(sorted(ids), call, sc)
+
+    def numeracja_parametru_sql(self, call, ctx, sc):
+        """Rok/miesiąc zmiennej czasowej zapisywany/porównywany z kolumną o nazwie numeru dokumentu."""
+        if not ctx.parametr_do_kolumny_numeru():
+            return
+        ids = set()
+        for a in list(call.args[1:]) + [k.value for k in call.keywords]:
+            ids |= self.rok_mies(a, sc)
+            for n in ast.walk(a):
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in ("strftime", "format"):
+                    ids |= set(self._naiwne(self.czasy_w(n.func.value if n.func.attr == "strftime" else n, sc)))
+        if ids:
+            self.zglos_numeracje(sorted(ids), call, sc)
 
     @staticmethod
     def _prefiks_w(stale):
@@ -1500,6 +1612,9 @@ class AnalizatorModulu:
 
     def zglos_numeracje(self, ids, node, sc):
         self.zuzyte.update(ids)
+        if (sc.qual, node.lineno) in self._num_linie:  # jedno trafienie na linię (najszerszy zapis)
+            return
+        self._num_linie.add((sc.qual, node.lineno))
         self.dodaj("numbering_by_date", sc.qual, node.lineno, "", self.segment(node), "likely")
 
     def on_fstring(self, js, sc):
@@ -1522,13 +1637,11 @@ class AnalizatorModulu:
                     self.numeracja_zdegradowane += 1
             if isinstance(v.value, ast.Attribute) and v.value.attr in ("year", "month"):
                 atrybuty.add(v.value.attr)
-                ids_atr.update(ids)
-        if atrybuty == {"year", "month"}:
-            nazwy = list(self.hint) + [sc.qual.split(".")[-1].lower()]
-            if prefiks or nazwa_identyfikatora(nazwy):
-                self.zglos_numeracje(sorted(ids_atr), js, sc)
-            else:
-                self.numeracja_zdegradowane += 1
+            ids_atr |= self.rok_mies(v.value, sc)
+        if ids_atr and self.kontekst_numeru(sc, prefiks):
+            self.zglos_numeracje(sorted(ids_atr), js, sc)
+        elif atrybuty == {"year", "month"}:
+            self.numeracja_zdegradowane += 1
 
     # ----- harmonogramy
     def sprawdz_harmonogram(self, call, sc):
@@ -1579,7 +1692,7 @@ class AnalizatorModulu:
     def zakoncz(self):
         for node, qual in self.czas_rej:
             info = self.czas[id(node)]
-            if not info.naiwny or id(node) in self.zuzyte:
+            if not info.naiwny or info.syntetyczny or id(node) in self.zuzyte:
                 continue
             i = id(node)
             testowy = self.czy_testowy(qual)
