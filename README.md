@@ -133,3 +133,102 @@ aliasów importu (`from datetime import datetime as dt`), wielolinijkowego SQL, 
 - Nie zakładaj schematu bazy — typy kolumn wyłącznie z plików wejściowych lub heurystyki (wtedy `uncertain`).
 - Nie flaguj każdego `now()` — `now()` jako **wartość zapisywana** do kolumny `timestamptz`
   (`DEFAULT now()`, `SET updated_at = now()`) jest poprawne.
+
+## Implementacja
+
+Stan: zaimplementowane w jednym pliku `sql_timezone_audit.py` (Python 3.8+, wyłącznie stdlib:
+`ast`, `re`, `argparse`, `json`, `os`, `fnmatch`, `tokenize`, `dataclasses`). Sprawdzone na Pythonie 3.11–3.13.
+
+### Jak uruchomić
+
+```
+python sql_timezone_audit.py --backend examples/backend \
+    --tz-columns examples/tz_columns.txt --local-columns examples/local_columns.txt
+python -m unittest            # 185 testów, bez sieci i bez bazy (tests/ jest pakietem)
+```
+
+- Kod wyjścia: `0` brak nowych wyników blokujących, `1` co najmniej jeden **nowy** wynik z kategorii
+  `sql_current_date_utc`, `sql_local_vs_now`, `sql_date_trunc_utc`, `py_naive_now`,
+  `scheduler_no_timezone`, `numbering_by_date`; `2` błąd użycia (brak katalogu, nieczytelny plik, zły JSON).
+- `--write-baseline` zapisuje baseline i kończy kodem `0` (świeżo zaakceptowany stan). Klucz baseline to
+  `plik|funkcja|kategoria|znormalizowany fragment` (bez numeru linii), z licznikiem powtórzeń: identyczny
+  wynik dodany drugi raz w tej samej funkcji jest nowy.
+- Zakres domyślnie wyklucza także `.venv` i `.git` (poza listą z zadania). `--exclude` przyjmuje wzorce
+  `fnmatch` dopasowywane do ścieżki, nazwy pliku i każdego członu ścieżki.
+- `--files-from` przyjmuje ścieżki względem `--backend` (lub bezwzględne/względem bieżącego katalogu),
+  także z `\`; domyślne wykluczenia nadal obowiązują.
+- Wyjście: UTF-8, końce linii LF, ścieżki z `/`, niezależnie od systemu (raport pisany jako bajty do
+  `sys.stdout.buffer`, pliki JSON/baseline z `newline="\n"`). Źródła są czytane z uwzględnieniem BOM-u,
+  deklaracji `coding:` i CRLF. W raporcie nie ma ścieżek bezwzględnych ani czasu, więc jest deterministyczny
+  (stąd golden). Na Windowsie uruchamiać dokładnie tak samo (`python -m unittest`); testy nie zakładają
+  separatora ścieżek. Nie uruchamiałem ich na prawdziwym Windowsie - tylko na Linuksie (do zrobienia w CI/matrix).
+- Golden: `examples/EXPECTED.md` to pełny raport dla fikcyjnego `examples/backend` (sklep z częściami).
+  Po zmianie narzędzia: `UPDATE_GOLDEN=1 python -m unittest tests.test_golden`, przejrzeć diff i zacommitować.
+
+### Decyzje
+
+- **Dwa przebiegi na jedno wywołanie SQL.** Tekst SQL jest odtwarzany z AST (literał, f-string z wstawkami
+  zdjętymi lub podstawionymi znaną zmienną, `+`, `+=`, `%`, `.format`, `" ".join(lista)`, `.append`,
+  stałe modułu i klasy, `self.STAŁA`) w obrębie funkcji i modułu. Potem `blank_sql` zamienia komentarze
+  na spacje, a w wersji "szkielet" także zawartość literałów tekstowych. Wszystkie detektory działają
+  na tekście o tej samej długości, więc indeksy pasują do oryginału (komentarz SQL ani tekst w literale nigdy
+  nie daje trafienia).
+- **"To samo wyrażenie" dla `AT TIME ZONE`** = `AT TIME ZONE` bezpośrednio po wyrażeniu (także za
+  zamykającymi nawiasami), wywołanie `timezone(...)` obejmujące wyrażenie albo `AT TIME ZONE` wewnątrz
+  operandu (np. `date_trunc('day', kol AT TIME ZONE '...')`, `(kol AT TIME ZONE '...')::date`).
+- **Operandy porównań** (`kolumna op NOW()`, `NOW() op kolumna`, `BETWEEN`, `kolumna +/- interval ... op NOW()`)
+  wyznacza prosty parser nawiasów, nie pełna gramatyka SQL.
+- **Typ kolumny**: tabela+kolumna z plików (`tabela.kolumna`, rozpoznawane też przez alias z `FROM/JOIN`),
+  potem sama nazwa z plików → `likely`; w przeciwnym razie heurystyka po nazwie → `uncertain`. Kolumna
+  nieznana i niepasująca do heurystyki jest ignorowana. Przy podanych plikach niewymienione kolumny
+  nadal korzystają z heurystyki (z `uncertain`).
+- **Pewność**: kategorie niezależne od typu kolumny (`sql_current_date_utc`, `numbering_by_date`,
+  `scheduler_no_timezone`, `py_utcnow_deprecated`) są `likely`; `py_naive_now` jest `likely` tylko gdy zapytanie
+  (albo klucz porównywanej wartości z bazy) dotyczy kolumny z plików, `py_naive_now_other` i `py_fixed_offset`
+  zawsze `uncertain`. Nigdy `certain`.
+- **`py_naive_now` vs `_other`**: śledzony jest przepływ danych w funkcji (`x = datetime.now()` → `x` w parametrach
+  `execute`/`query_*`, w liście/krotce parametrów, w f-stringu SQL; porównanie z wartością pochodzącą z wyniku
+  `query_*` lub z pętli po nim). Plik/funkcja testowa (`test_*.py`, `*_test.py`, `conftest.py`, katalog `tests`,
+  funkcja `test*`) zawsze daje `_other`.
+- **`numbering_by_date`** zastępuje `sql_current_date_utc` / `py_naive_now(_other)` dla tego samego wyrażenia
+  (jedno trafienie, nie dwa). W Pythonie: format z rokiem i miesiącem bez dnia/godziny, albo format z dniem, gdy nazwa
+  zmiennej/funkcji sugeruje numer (`numer`, `number`, `nr`, `doc`, `order`, `faktur`, `zlec`...); także
+  `f"{d.year}/{d.month}"`. Nazwa pliku `f"raport_{date.today():%Y%m%d}.csv"` nie jest numeracją.
+- **Harmonogramy**: `add_job(..., 'cron', hour=...)`, `@x.scheduled_job('cron', ...)`, `CronTrigger(...)`,
+  `CronTrigger.from_crontab(...)`, celery `crontab(...)` i słowniki `{'trigger': 'cron', ...}`. Wyzwalacz `cron` bez
+  pola godzinowego/dnia (np. samo `minute="*/5"`) i `interval` są pomijane. Strefa ustawiona w konstruktorze
+  `*Scheduler(timezone=...)`, `Celery(...)`, `conf.update(timezone=...)` lub przypisaniu `timezone = ...`
+  / `CELERY_TIMEZONE` w tym samym module jest uznawana za jawną.
+- **Odporność**: błąd składni → ostrzeżenie na stderr i pominięcie pliku; wyjątek w analizie pojedynczej konstrukcji
+  jest łapany (ostrzeżenie), reszta pliku analizowana dalej. Zamknięcie w `try/except` obejmuje także zbyt głęboką
+  rekurencję.
+
+### Ograniczenia i znane fałszywe trafienia
+
+- Analizowane jest tylko SQL widoczne w pliku: pierwszy argument wywołań `query_one/query_all/execute/execute_return/
+  cur.execute/executemany` (też przez alias importu). SQL składany w innej funkcji i przekazany jako parametr, z pliku
+  `.sql` albo z ORM-a nie jest widziany; zmienna SQL, która nie trafia do rozpoznanego helpera, nie jest analizowana.
+- Numer linii wyniku SQL = linia początku literału + liczba nowych linii przed trafieniem; przy ciągu literałów
+  sklejonych niejawnie (`"a" "b"` na kilku liniach) lub zmiennej złożonej z wielu przypisań bywa przesunięty.
+  Klucz baseline nie zależy od linii, więc to tylko wygoda czytania.
+- Śledzenie zmiennych jest liniowe (kolejność źródła, obie gałęzie `if` są traktowane jak wykonane po kolei) i nie obejmuje
+  przekazywania przez argumenty funkcji ani atrybuty obiektów (poza `self.STAŁA` klasy).
+- Znane fałszywe trafienia:
+  - `py_fixed_offset` dla zwykłych terminów ważności (`datetime.now() + timedelta(hours=1)` w tokenie) - dlatego zawsze `uncertain`;
+  - `sql_fixed_offset` dla `kolumna +/- interval '1 hour'` oznaczającego realne "godzinę przed wydarzeniem" - `uncertain`;
+  - `sql_local_vs_now` dla kolumny, którą heurystyka nazwy uznała za lokalną (`end*`, `start*`, `due*`), a w bazie jest
+    `timestamptz`; skutek: `uncertain` - rozstrzyga plik `--tz-columns`;
+  - `CURRENT_DATE` w `DEFAULT` w DDL wysłanym przez `execute` jest raportowane tak samo jak w zapytaniu (to też UTC);
+  - SQL w zwykłym stringu, który wygląda jak SQL i trafia do `execute`, ale nie jest wysyłany do bazy.
+- Nie wykrywane (celowo poza zakresem): `timezone(timedelta(hours=2))` jako stała strefa, `time.time()`/`time.localtime()`,
+  biblioteki `pendulum`/`arrow`, `datetime.fromtimestamp(ts)` bez strefy, funkcje składowane w bazie, `SET TIME ZONE`.
+- Wydajność: 200 plików ~ 0,4 s (test `test_performance_200_files`).
+
+### Otwarte pytania / decyzje do rozstrzygnięcia
+
+1. Czy `SET starts_at = now()` (zapis UTC do kolumny lokalnej) ma być osobną kategorią? Obecnie wpada w `sql_local_vs_now`
+   (operator `=` obok kolumny lokalnej), bo spec mówi tylko o porównaniu.
+2. Czy zaufać strefie ustawionej na poziomie harmonogramu (obecnie tak - brak wyniku), czy raportować jako `uncertain`?
+3. Czy `py_fixed_offset` powinno obejmować też `timezone(timedelta(hours=2))` oraz godziny inne niż 1/2?
+4. Czy zakres domyślnych wykluczeń ma zawierać także `.venv`/`.git` (dodane tu na własną rękę)?
+5. Uruchomienie testów na prawdziwym Windowsie w CI (matrix) - brak w tym repo konfiguracji CI.
