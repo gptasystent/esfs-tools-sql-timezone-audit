@@ -144,7 +144,7 @@ Stan: zaimplementowane w jednym pliku `sql_timezone_audit.py` (Python 3.8+, wył
 ```
 python sql_timezone_audit.py --backend examples/backend \
     --tz-columns examples/tz_columns.txt --local-columns examples/local_columns.txt
-python -m unittest            # 231 testów, bez sieci i bez bazy (tests/ jest pakietem)
+python -m unittest            # 258 testów, bez sieci i bez bazy (tests/ jest pakietem)
 ```
 
 - Kod wyjścia: `0` brak nowych wyników blokujących, `1` co najmniej jeden **nowy** wynik z kategorii
@@ -274,3 +274,31 @@ Ograniczenia dopisane w rundzie 2:
 - Kolumna zapisu w `SET` jest rozpoznawana tylko dla `kol = NOW()...` bezpośrednio po `SET`/przecinku; zapis przez `CASE`/podzapytanie, `INSERT ... SELECT`
   i wielowierszowe `VALUES (...), (...)` (poza pierwszym wierszem) nie jest śledzony.
 - Domyślny parametr (pkt 5) jest rozpoznawany tylko dla `.get(...)` w tym samym zakresie funkcji.
+
+### Runda 3 (numeracja przez zmienną, warianty wartości domyślnej)
+
+Testy: `tests/test_round3.py` (pisane przed zmianą kodu; 13 z nich padało). Razem 258 testów, golden odświeżony.
+
+1. **`numbering_by_date` przez zmienną w tej samej funkcji.** `today = datetime.now()` / `d = date.today()` oraz wynik zapytania
+   `SELECT CURRENT_DATE` / `SELECT now()` bez strefy (lista SELECT przed `FROM`; zmienna dostaje "źródło czasu" odtworzone z SQL)
+   są śledzone po przypisaniach (`deps`, jak taint) i uznawane za numerację, gdy zmienna lub jej `.year`/`.month`/`strftime` trafia:
+   - do f-stringa, `"..." .format(...)`, `"..." % (...)` lub konkatenacji z prefiksem dokumentu (`"FV/"`, `"ZAM/"`),
+   - albo do celu przypisania/funkcji o nazwie pasującej do `numer|nr|number|seq|seria|prefix|numeracja|invoice|order_no`,
+   - albo jako parametr SQL zapisywany/porównywany z kolumną o takiej nazwie (`SET order_no = %s`, `doc_number LIKE %s`,
+     pozycja w `INSERT ... VALUES`); mapowanie jest na poziomie zapytania (jest taka kolumna + parametr pochodzi z roku/miesiąca/strftime),
+     nie parametr-do-kolumny.
+   Reguła formatu dla `strftime`/`:%Y` została rozluźniona z "rok i miesiąc" do "rok lub miesiąc", ale tylko w kontekście numeru
+   (prefiks albo nazwa). Ta sama zmienna użyta tylko do logu/etykiety daje `py_naive_now_other`. Zmienna z innej funkcji nie jest śledzona
+   (poza kopią środowiska modułu). Jedno trafienie `numbering_by_date` na linię i funkcję. Źródło z SQL nie daje własnego
+   `py_naive_now_other`; sam `SELECT CURRENT_DATE` nadal jest `sql_current_date_utc`.
+2. **Wartość domyślna parametru.** Podstawowy wzorzec (`x = request.args.get(..)`, `if not x: x = datetime.now().strftime(..)`)
+   był obsłużony już w rundzie 2 (ważność średnia + dopisek w `dlaczego`); ta runda dodaje pominięte warianty, w których nadal wychodziła
+   ważność wysoka: wartość domyślna w gałęzi `else` (`if x: ... else: x = now`), warunek `x is None or x == ""` (także `or`/`and`),
+   `(a.get(..) or "").strip() or <teraz>`, `a[..] if .. else <teraz>`. Parametrem jest każda zmienna z `.get(...)` lub indeksowania.
+   Test negatywny: wartość spoza `.get`/`[]` (np. `cache.compute()`) i bezwarunkowe `datetime.now()` w SQL zostają `wysoka`.
+
+Ograniczenia/fałszywe trafienia dopisane w rundzie 3:
+- Nazwa funkcji też jest podpowiedzią numeru: `def invoice_report(): return date.today().strftime("%Y")` da `numbering_by_date`.
+- "Parametr" to dowolny `.get(...)`/`[...]`, także zwykły słownik; wartość domyślna z takiego słownika też dostanie ważność średnią.
+- Kolumna numeru dla parametru SQL jest rozpoznawana dla całego zapytania, więc `SET order_no = %s, label = %s` z rokiem w `label` też da trafienie.
+- Źródło z SQL rozpoznawane tylko dla `SELECT` z `CURRENT_DATE`/`now()` przed pierwszym `FROM`; przez podzapytania/CTE nie.
