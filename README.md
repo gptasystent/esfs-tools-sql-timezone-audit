@@ -144,12 +144,12 @@ Stan: zaimplementowane w jednym pliku `sql_timezone_audit.py` (Python 3.8+, wył
 ```
 python sql_timezone_audit.py --backend examples/backend \
     --tz-columns examples/tz_columns.txt --local-columns examples/local_columns.txt
-python -m unittest            # 185 testów, bez sieci i bez bazy (tests/ jest pakietem)
+python -m unittest            # 231 testów, bez sieci i bez bazy (tests/ jest pakietem)
 ```
 
 - Kod wyjścia: `0` brak nowych wyników blokujących, `1` co najmniej jeden **nowy** wynik z kategorii
   `sql_current_date_utc`, `sql_local_vs_now`, `sql_date_trunc_utc`, `py_naive_now`,
-  `scheduler_no_timezone`, `numbering_by_date`; `2` błąd użycia (brak katalogu, nieczytelny plik, zły JSON).
+  `scheduler_no_timezone`, `numbering_by_date`, `sql_utc_into_local_column`; `2` błąd użycia (brak katalogu, nieczytelny plik, zły JSON).
 - `--write-baseline` zapisuje baseline i kończy kodem `0` (świeżo zaakceptowany stan). Klucz baseline to
   `plik|funkcja|kategoria|znormalizowany fragment` (bez numeru linii), z licznikiem powtórzeń: identyczny
   wynik dodany drugi raz w tej samej funkcji jest nowy.
@@ -190,10 +190,8 @@ python -m unittest            # 185 testów, bez sieci i bez bazy (tests/ jest p
   `execute`/`query_*`, w liście/krotce parametrów, w f-stringu SQL; porównanie z wartością pochodzącą z wyniku
   `query_*` lub z pętli po nim). Plik/funkcja testowa (`test_*.py`, `*_test.py`, `conftest.py`, katalog `tests`,
   funkcja `test*`) zawsze daje `_other`.
-- **`numbering_by_date`** zastępuje `sql_current_date_utc` / `py_naive_now(_other)` dla tego samego wyrażenia
-  (jedno trafienie, nie dwa). W Pythonie: format z rokiem i miesiącem bez dnia/godziny, albo format z dniem, gdy nazwa
-  zmiennej/funkcji sugeruje numer (`numer`, `number`, `nr`, `doc`, `order`, `faktur`, `zlec`...); także
-  `f"{d.year}/{d.month}"`. Nazwa pliku `f"raport_{date.today():%Y%m%d}.csv"` nie jest numeracją.
+- **`numbering_by_date`** (zawężone w rundzie 2, patrz niżej) zastępuje `sql_current_date_utc` / `py_naive_now(_other)`
+  dla tego samego wyrażenia (jedno trafienie, nie dwa).
 - **Harmonogramy**: `add_job(..., 'cron', hour=...)`, `@x.scheduled_job('cron', ...)`, `CronTrigger(...)`,
   `CronTrigger.from_crontab(...)`, celery `crontab(...)` i słowniki `{'trigger': 'cron', ...}`. Wyzwalacz `cron` bez
   pola godzinowego/dnia (np. samo `minute="*/5"`) i `interval` są pomijane. Strefa ustawiona w konstruktorze
@@ -226,9 +224,53 @@ python -m unittest            # 185 testów, bez sieci i bez bazy (tests/ jest p
 
 ### Otwarte pytania / decyzje do rozstrzygnięcia
 
-1. Czy `SET starts_at = now()` (zapis UTC do kolumny lokalnej) ma być osobną kategorią? Obecnie wpada w `sql_local_vs_now`
-   (operator `=` obok kolumny lokalnej), bo spec mówi tylko o porównaniu.
+1. ~~Zapis `SET starts_at = now()`~~ - rozstrzygnięte w rundzie 2: osobna kategoria `sql_utc_into_local_column`.
 2. Czy zaufać strefie ustawionej na poziomie harmonogramu (obecnie tak - brak wyniku), czy raportować jako `uncertain`?
 3. Czy `py_fixed_offset` powinno obejmować też `timezone(timedelta(hours=2))` oraz godziny inne niż 1/2?
 4. Czy zakres domyślnych wykluczeń ma zawierać także `.venv`/`.git` (dodane tu na własną rękę)?
 5. Uruchomienie testów na prawdziwym Windowsie w CI (matrix) - brak w tym repo konfiguracji CI.
+
+### Runda 2 (poprawki po uruchomieniu na dużym prawdziwym backendzie)
+
+Dla każdej klasy najpierw powstał test negatywny na fikcyjnym fixture (`tests/test_round2.py`), potem poprawiony został kod.
+Testów jest 231; golden `examples/EXPECTED.md` odświeżony (nowe pliki/funkcje w `examples/backend`).
+
+1. **Końce linii.** `.gitattributes` (`* text=auto eol=lf`, `*.md`/`*.txt`/`*.json`/`*.py` jako `eol=lf`). Testy golden porównują po
+   normalizacji `\r\n` → `\n` po obu stronach, a `test_expected_file_is_lf_utf8` toleruje CRLF z checkoutu `autocrlf=true`.
+   Sprawdzone lokalnie przez zamianę wszystkich plików `examples/` na CRLF (wszystkie testy zielone); na prawdziwym
+   Windowsie z `autocrlf=true` nadal niesprawdzone.
+2. **`sql_fixed_offset`.** Interwał flagowany tylko gdy jest dodany do **kolumny** czasu (`kolumna + interval '2 hours'`;
+   `likely`, gdy w operandzie jest `AT TIME ZONE`, inaczej `uncertain`) albo dla literałów `'+01'`, `'+02'`, `'+01:00'`, `'+02:00'`.
+   Arytmetyka na samym `NOW()` - także `(NOW() AT TIME ZONE '...') - INTERVAL '1 hour'` i `timezone('...', now()) + interval '2 days'` -
+   nie daje wyniku. Zachowany (dotychczasowy test) przypadek `(kolumna AT TIME ZONE 'UTC') + interval '2 hours'` nadal jest `likely`,
+   bo to właśnie dorabianie przesunięcia do kolumny.
+3. **`numbering_by_date` zawężone** do wartości, która wchodzi w identyfikator dokumentu:
+   - literał prefiksu dokumentu (wielkie litery + separator: `"ZAM/"`, `"FV-"`) w tym samym f-stringu / konkatenacji / `||` / `concat(...)`;
+   - albo nazwa zmiennej, stałej, funkcji lub kolumny pasuje do `numer|nr|number|seq|prefix|numeracja|invoice|order_no`
+     (SQL: kolumna w `SET kol = ...`, w pozycji `INSERT ... VALUES`, po lewej/prawej stronie `=`/`LIKE`; Python: cel przypisania
+     i nazwa otaczającej funkcji).
+   Reszta (klucze w magazynie obiektów `uploads/{...:%Y/%m}`, `to_char(..., 'MM-DD')` dla urodzin, etykiety roku, komunikaty) trafia do
+   zwykłych kategorii: `py_naive_now(_other)` albo `sql_current_date_utc` (także dla `to_char(now()/current_timestamp, ...)`,
+   gdzie data jest liczona w UTC). Prefiks pisany małymi literami (`"uploads/"`, `"raport_"`) celowo nie liczy się jako prefiks dokumentu.
+   Raport i JSON mają licznik zawężeń (`numbering_zawezone`): ile wyników według reguły z rundy 1 było `numbering_by_date`, a teraz nie jest.
+   Zmiana wymusiła edycję dwóch testów z rundy 1, bo były sprzeczne z nową specyfikacją: `to_char(CURRENT_DATE,'YYYY/MM')` bez prefiksu
+   i `f"{d.year}/{d.month}"` bez nazwy numeru nie są już numeracją (testy dostały prefiks `'FV/' ||` oraz zmienną `nr`).
+4. **`sql_utc_into_local_column`** (wysoka, blokująca): `NOW()`/`CURRENT_TIMESTAMP` (także z `+ interval`) w `UPDATE ... SET kol = ...`,
+   `ON CONFLICT ... DO UPDATE SET` i na pozycji kolumny w `INSERT ... VALUES`. `likely` tylko dla kolumny z `--local-columns`,
+   `uncertain` dla heurystyki nazwy. Zapis do kolumny systemowej (lub nieznanej) jest poprawny/pomijany; `AT TIME ZONE`/`timezone()` wyklucza.
+   Zapis nie jest już dodatkowo raportowany jako `sql_local_vs_now`; porównania w `WHERE` zostają tam, gdzie były.
+5. **Domyślny parametr z naiwnego now().** Wzorce `x = ....get(...)` + `if not x: x = datetime.now().strftime(...)` (także `x is None`, `x == ""`)
+   oraz `x = ....get(...) or date.today()...`, gdy `x` trafia do SQL, zostają `py_naive_now`, ale z ważnością `srednia` i dopiskiem w `dlaczego`.
+   Uwaga: kod wyjścia liczy się po **kategorii**, więc taki wynik nadal daje `1` (obniżona jest tylko ważność i miejsce w "najpierw napraw").
+6. **Dopasowanie plików kolumn.** Przy podanych `--tz-columns`/`--local-columns` podsumowanie ma linię
+   `Kolumny z plików dopasowane w analizowanym SQL: systemowe X/Y, lokalne A/B` (także `kolumny_dopasowane` w JSON). Wpis `tabela.kolumna`
+   liczy się, gdy tabela występuje w zapytaniu (też przez alias); wpis samej nazwy - gdy kolumna występuje gdziekolwiek. `0/N` oznacza
+   plik kolumn niedopasowany do analizowanego kodu.
+
+Ograniczenia dopisane w rundzie 2:
+- Prefiks dokumentu rozpoznawany jest po kształcie (`[A-Z]{1,8}` + `/ - _ .`); prefiks z cyfrą (`"S3/"`) lub małymi literami nie jest widziany,
+  więc taka numeracja bez nazwy zmiennej/kolumny sugerującej numer trafi do zwykłych kategorii (fałszywy negatyw `numbering_by_date`).
+- Nazwy-podpowiedzi są dopasowywane po podciągu (`nr`, `seq`, `prefix`), więc zmienna `prefix_dir` ścieżki pliku z datą dałaby fałszywy `numbering_by_date`.
+- Kolumna zapisu w `SET` jest rozpoznawana tylko dla `kol = NOW()...` bezpośrednio po `SET`/przecinku; zapis przez `CASE`/podzapytanie, `INSERT ... SELECT`
+  i wielowierszowe `VALUES (...), (...)` (poza pierwszym wierszem) nie jest śledzony.
+- Domyślny parametr (pkt 5) jest rozpoznawany tylko dla `.get(...)` w tym samym zakresie funkcji.

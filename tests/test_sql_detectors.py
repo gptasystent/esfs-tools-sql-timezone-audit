@@ -187,7 +187,7 @@ class FixedOffset(unittest.TestCase):
 
 class Numbering(unittest.TestCase):
     def test_to_char_current_date(self):
-        self.assertEqual(sql_kat("SELECT to_char(CURRENT_DATE, 'YYYY/MM')"), ["numbering_by_date"])
+        self.assertEqual(sql_kat("SELECT 'FV/' || to_char(CURRENT_DATE, 'YYYY/MM')"), ["numbering_by_date"])
 
     def test_to_char_now(self):
         self.assertEqual(sql_kat("SELECT 'N/' || to_char(now(), 'YYYY-MM')"), ["numbering_by_date"])

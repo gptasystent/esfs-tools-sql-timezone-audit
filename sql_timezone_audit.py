@@ -54,6 +54,11 @@ KATEGORIE = OrderedDict([
         "Sztywne przesunięcie godzinowe psuje się przy zmianie czasu (ostatnie niedziele "
         "marca i października).",
         "Zamień przesunięcie na AT TIME ZONE 'Europe/Warsaw'.")),
+    ("sql_utc_into_local_column", (
+        "wysoka",
+        "NOW()/CURRENT_TIMESTAMP (UTC) zapisywane do kolumny lokalnej (timestamp bez strefy): "
+        "kolumna ma przechowywać czas ze ściany zegara, a dostaje UTC.",
+        "Zapisz NOW() AT TIME ZONE 'Europe/Warsaw' albo zmień kolumnę na timestamptz.")),
     ("py_naive_now", (
         "wysoka",
         "Naiwny \"teraz/dziś\" (bez tzinfo) trafia do SQL albo jest porównywany z wartością "
@@ -87,14 +92,17 @@ KATEGORIE = OrderedDict([
 
 KATEGORIE_BLOKUJACE = frozenset([
     "sql_current_date_utc", "sql_local_vs_now", "sql_date_trunc_utc",
-    "py_naive_now", "scheduler_no_timezone", "numbering_by_date",
+    "py_naive_now", "scheduler_no_timezone", "numbering_by_date", "sql_utc_into_local_column",
 ])
 
 # kolejność w sekcji "najpierw napraw" (od największego ryzyka)
-KOLEJNOSC_RYZYKA = ("numbering_by_date", "scheduler_no_timezone", "sql_current_date_utc",
-                    "sql_local_vs_now", "sql_date_trunc_utc", "py_naive_now")
+KOLEJNOSC_RYZYKA = ("numbering_by_date", "scheduler_no_timezone", "sql_utc_into_local_column",
+                    "sql_current_date_utc", "sql_local_vs_now", "sql_date_trunc_utc", "py_naive_now")
 
 MAKS_FRAGMENT = 120
+
+OPIS_DOMYSLNEJ = ("To wartość domyślna parametru zapytania (np. miesiąc/dzień, gdy nie podano): "
+                  "błąd widać tylko tuż po północy czasu lokalnego.")
 
 
 # --------------------------------------------------------------------------- model
@@ -139,6 +147,10 @@ class Raport:
     pliki: list = field(default_factory=list)
     wyniki: list = field(default_factory=list)
     pominiete: list = field(default_factory=list)
+    numeracja_zawezona: int = 0
+    trafione: set = field(default_factory=set)
+    kolumn_tz: int = 0
+    kolumn_local: int = 0
 
 
 def normalizuj(tekst):
@@ -181,6 +193,18 @@ class KonfiguracjaKolumn:
     @classmethod
     def z_tekstow(cls, tz_tekst="", local_tekst=""):
         return cls(parsuj_liste_kolumn(tz_tekst), parsuj_liste_kolumn(local_tekst))
+
+    def dopasowania(self, tabele, kolumna):
+        """Wpisy z plików pasujące do kolumny: lista (rodzaj, wpis)."""
+        kolumna = kolumna.lower()
+        wynik = []
+        for rodzaj, zbior in (("tz", self.tz), ("local", self.local)):
+            for t in tabele:
+                if t + "." + kolumna in zbior:
+                    wynik.append((rodzaj, t + "." + kolumna))
+            if kolumna in zbior:
+                wynik.append((rodzaj, kolumna))
+        return wynik
 
     def classify(self, tabele, kolumna):
         """-> (rodzaj, pewne): rodzaj 'tz'/'local'/None, pewne=True gdy z plików wejściowych."""
@@ -491,7 +515,8 @@ _BETWEEN_BEFORE = re.compile(
 
 _LIT = (r"(?:(?:date|timestamp|timestamptz)\s+)?'(\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)?)'"
         r"(?:\s*::\s*(?:date|timestamp|timestamptz))?")
-_COL = r"((?:%s\s*\.\s*)?%s)" % (_IDENT, _IDENT)
+_CHAIN_PATTERN = r"(?:%s\s*\.\s*)?%s" % (_IDENT, _IDENT)
+_COL = r"(%s)" % _CHAIN_PATTERN
 _CMP = r"(?:<=|>=|<>|!=|=|<|>)"
 _LIT_FWD = re.compile(_COL + r"\s*" + _CMP + r"\s*" + _LIT, re.I)
 _LIT_REV = re.compile(_LIT + r"\s*" + _CMP + r"\s*" + _COL + r"(?![\w$])(?!\s*[.(])", re.I)
@@ -520,6 +545,14 @@ class KontekstSql:
             if al and al.lower() not in SQL_KEYWORDS:
                 self.aliases[al.lower()] = tab
         self.maska = _maskuj_literaly(self.code, sql_single=True)
+        self.trafione = set()
+        if cfg.tz or cfg.local:
+            for m in _COLREF.finditer(self.skel):
+                if m.group(2).lower() in SQL_KEYWORDS:
+                    continue
+                q = m.group(1)
+                tabele = [self.aliases.get(q.lower(), q.lower())] if q else self.tabele
+                self.trafione.update(cfg.dopasowania(tabele, m.group(2)))
 
     def rodzaj(self, kwal, nazwa):
         if nazwa.lower() in SQL_KEYWORDS:
@@ -616,9 +649,71 @@ def _pewnosc(kolumny_rodzaj):
     return "likely" if any(p for _, p, _ in kolumny_rodzaj) else "uncertain"
 
 
-def analizuj_sql(sql, cfg):
-    """-> lista surowych wyników (kategoria, start, koniec, pewnosc, kontekst)."""
+_NAZWA_ID = re.compile(r"numer|(?<![a-z])nr(?![a-z])|number|seq|prefix|numeracja|invoice|order_no", re.I)
+_PREFIKS_DOK = re.compile(r"[A-Z]{1,8}[/\-_.]")
+
+
+def nazwa_identyfikatora(nazwy):
+    return any(_NAZWA_ID.search(n or "") for n in nazwy)
+
+
+def _kolumna_insertu(skel, pos):
+    """Nazwa kolumny, do której trafia wartość z pozycji ``pos`` w INSERT ... VALUES (...)."""
+    for m in re.finditer(r"\binsert\s+into\s+[\w$.\"]+\s*\(([^)]*)\)\s*values\s*\(", skel, re.I):
+        o = m.end() - 1
+        c = _match_fwd(skel, o)
+        if c < 0 or not (o < pos < c):
+            continue
+        kol = [x.strip().strip('"').lower() for x in m.group(1).split(",")]
+        for i, (a, b) in enumerate(_split_top(skel, o + 1, c)):
+            if a <= pos < b:
+                return kol[i] if i < len(kol) else None
+    return None
+
+
+def _kolumna_zapisu(skel, poz):
+    """Kolumna, do której zapisywana jest wartość z pozycji ``poz`` (INSERT ... VALUES lub SET kol = ...)."""
+    kol = _kolumna_insertu(skel, poz)
+    if kol:
+        return kol
+    pre = skel[:poz]
+    ostatni_set = max((m.start() for m in re.finditer(r"\bset\b", pre, re.I)), default=-1)
+    ostatni_where = max((m.start() for m in re.finditer(r"\bwhere\b", pre, re.I)), default=-1)
+    if ostatni_set < 0 or ostatni_set < ostatni_where:
+        return None
+    m = re.search(r"(%s)\s*=\s*(?:\(\s*)*$" % _CHAIN_PATTERN, pre)
+    if m and not pre[:m.start()].rstrip().endswith(("<", ">", "!")):
+        return m.group(1).split(".")[-1].lower()
+    return None
+
+
+def _numeracja_sql(skel, code, start, koniec, nazwy):
+    """Czy wynik to_char(teraz, ...) WCHODZI W IDENTYFIKATOR dokumentu."""
+    if nazwa_identyfikatora(nazwy):
+        return True
+    przed = re.search(r"'([^']*)'\s*(?:\|\||,)\s*$", code[:start])
+    if przed and _PREFIKS_DOK.match(przed.group(1)):
+        return True
+    po = re.match(r"\s*\|\|\s*'([^']*)'", code[koniec:])
+    if po and _PREFIKS_DOK.match(po.group(1)):
+        return True
+    lewa = re.search(r"(%s)\s*(?:=|like|ilike)\s*(?:'[^']*'\s*\|\|\s*)*$" % _CHAIN_PATTERN, skel[:start], re.I)
+    if lewa and nazwa_identyfikatora([lewa.group(1).split(".")[-1]]):
+        return True
+    prawa = re.match(r"\s*(?:\|\|\s*'[^']*'\s*)*(?:=|like|ilike)\s*(%s)" % _CHAIN_PATTERN, skel[koniec:], re.I)
+    if prawa and nazwa_identyfikatora([prawa.group(1).split(".")[-1]]):
+        return True
+    kol = _kolumna_insertu(skel, start)
+    return bool(kol and nazwa_identyfikatora([kol]))
+
+
+def analizuj_sql(sql, cfg, nazwy=()):
+    """-> (kontekst, lista surowych wyników (kategoria, start, koniec, pewnosc)).
+
+    ``nazwy``: nazwy zmiennych/funkcji wokół wywołania (podpowiedź dla numeracji dokumentów).
+    """
     ctx = KontekstSql(sql, cfg)
+    ctx.numeracja_zdegradowane = 0
     skel, code = ctx.skel, ctx.code
     surowe = []
     spany_numeracji = []
@@ -637,8 +732,13 @@ def analizuj_sql(sql, cfg):
         fmt = code[a1[0]:a1[1]]
         if _NOWISH.search(pierwszy) and not _TZ_MARK.search(pierwszy) \
                 and re.search(r"y{2,4}|mm|month|mon", fmt, re.I):
-            surowe.append(("numbering_by_date", m.start(), c + 1, "likely"))
-            spany_numeracji.append((m.start(), c + 1))
+            if _numeracja_sql(skel, code, m.start(), c + 1, nazwy):
+                surowe.append(("numbering_by_date", m.start(), c + 1, "likely"))
+                spany_numeracji.append((m.start(), c + 1))
+            else:
+                ctx.numeracja_zdegradowane += 1
+                if not _CUR_DATE_RE.search(pierwszy):  # NOW()/CURRENT_TIMESTAMP: data liczona w UTC
+                    surowe.append(("sql_current_date_utc", m.start(), c + 1, "likely"))
 
     def w_numeracji(p):
         return any(a <= p < b for a, b in spany_numeracji)
@@ -676,6 +776,12 @@ def analizuj_sql(sql, cfg):
                 e = post_m.end()
             else:
                 break
+        zapis = _kolumna_zapisu(skel, m.start())
+        if zapis:
+            rodzaj, pewne = ctx.rodzaj(None, zapis)
+            if rodzaj == "local":
+                surowe.append(("sql_utc_into_local_column", m.start(), e, "likely" if pewne else "uncertain"))
+            continue
         kolumny = []
         pre = skel[:s]
         mo = _OP_BEFORE.search(pre)
@@ -773,9 +879,13 @@ def analizuj_sql(sql, cfg):
         lewy = operand_before(skel, m.start())
         if not lewy:
             continue
+        # arytmetyka na samym NOW() (także po AT TIME ZONE) to okno czasowe, nie przesunięcie strefy;
+        # flagujemy tylko interwał dodany do KOLUMNY czasu
+        if not ctx.kolumny(lewy[0], lewy[1]):
+            continue
         if _ma_strefe(skel, lewy[0], lewy[1]) or _TZ_AFTER.match(skel, m.end()):
             surowe.append(("sql_fixed_offset", lewy[0], m.end(), "likely"))
-        elif ctx.kolumny(lewy[0], lewy[1]):
+        else:
             surowe.append(("sql_fixed_offset", lewy[0], m.end(), "uncertain"))
 
     kategorie = OrderedDict()
@@ -818,6 +928,7 @@ class Zakres:
         self.qual = qual
         self.env = dict(env) if env else {}
         self.deps = dict(deps) if deps else {}
+        self.getnames = set()
         self.taint = set(taint) if taint else set()
         self.cls = cls
         self.klasa = klasa
@@ -880,6 +991,9 @@ class AnalizatorModulu:
         self.uzycie_db = {}
         self.zuzyte = set()
         self.bez_cron = set()
+        self.numeracja_zdegradowane = 0
+        self.trafione = set()
+        self.domyslne = set()
         self.wyniki_ostrzezenia = []
         self._przygotuj()
 
@@ -893,6 +1007,10 @@ class AnalizatorModulu:
                 for a in n.names:
                     if a.name != "*":
                         self.importy[a.asname or a.name] = n.module + "." + a.name
+        self.rodzic = {}
+        for p in ast.walk(self.tree):
+            for ch in ast.iter_child_nodes(p):
+                self.rodzic[id(ch)] = p
         self.func_ids = set(id(c.func) for c in ast.walk(self.tree) if isinstance(c, ast.Call))
         for n in ast.walk(self.tree):
             if isinstance(n, ast.Call):
@@ -947,8 +1065,11 @@ class AnalizatorModulu:
             return type(node).__name__
         return _przytnij(_ws(tekst))
 
-    def dodaj(self, kategoria, qual, linia, helper, fragment, pewnosc):
+    def dodaj(self, kategoria, qual, linia, helper, fragment, pewnosc, waznosc=None, dlaczego_extra=""):
         waz, dlaczego, propozycja = KATEGORIE[kategoria]
+        waz = waznosc or waz
+        if dlaczego_extra:
+            dlaczego = dlaczego + " " + dlaczego_extra
         fragment = _przytnij(_ws(fragment))
         k = (qual, linia, kategoria, normalizuj(fragment))
         if k in self._widziane:
@@ -996,6 +1117,11 @@ class AnalizatorModulu:
             self.hint = self._nazwy_celow(st)
             self.scan(st, sc)
             self.hint = []
+        elif isinstance(st, ast.If):
+            self.on_if(st, sc)
+            for _, wartosc in ast.iter_fields(st):
+                for it in (wartosc if isinstance(wartosc, list) else [wartosc]):
+                    self.visit_item(it, sc)
         elif isinstance(st, ast.Expr):
             self.on_expr_stmt(st, sc)
             self.scan(st, sc)
@@ -1157,6 +1283,13 @@ class AnalizatorModulu:
                     sc.env.pop(k, None)
         czasy = self.czasy_w(wartosc, sc)
         skaz = self.skazone(wartosc, sc)
+        if isinstance(wartosc, ast.Call) and isinstance(wartosc.func, ast.Attribute) and wartosc.func.attr == "get":
+            sc.getnames.update(proste)
+        elif isinstance(wartosc, ast.BoolOp) and isinstance(wartosc.op, ast.Or) and len(wartosc.values) > 1 \
+                and isinstance(wartosc.values[0], ast.Call) and isinstance(wartosc.values[0].func, ast.Attribute) \
+                and wartosc.values[0].func.attr == "get":
+            for v in wartosc.values[1:]:
+                self.domyslne |= self.czasy_w(v, sc)
         for nm in nazwy:
             if aug:
                 sc.deps[nm] = sc.deps.get(nm, set()) | czasy
@@ -1168,6 +1301,21 @@ class AnalizatorModulu:
                 sc.taint.add(nm)
             elif not aug:
                 sc.taint.discard(nm)
+
+    def on_if(self, st, sc):
+        """``if not x: x = <naiwne teraz>`` gdy x pochodzi z ``.get(...)`` - wartość domyślna parametru."""
+        t = st.test
+        nazwa = None
+        if isinstance(t, ast.UnaryOp) and isinstance(t.op, ast.Not) and isinstance(t.operand, ast.Name):
+            nazwa = t.operand.id
+        elif isinstance(t, ast.Compare) and isinstance(t.left, ast.Name) and len(t.comparators) == 1 \
+                and isinstance(t.comparators[0], ast.Constant) and t.comparators[0].value in (None, "") \
+                and isinstance(t.ops[0], (ast.Is, ast.Eq)):
+            nazwa = t.left.id
+        if nazwa and nazwa in sc.getnames:
+            for b in st.body:
+                if isinstance(b, ast.Assign) and any(isinstance(x, ast.Name) and x.id == nazwa for x in b.targets):
+                    self.domyslne |= self.czasy_w(b.value, sc)
 
     def on_expr_stmt(self, st, sc):
         v = st.value
@@ -1238,8 +1386,12 @@ class AnalizatorModulu:
         if isinstance(call.func, ast.Attribute) and call.func.attr == "strftime" and call.args:
             fmt = _stala_tekst(call.args[0])
             ids = self._naiwne(self.czasy_w(call.func.value, sc))
-            if fmt and ids and self.numeracja_formatu(fmt, sc):
-                self.zglos_numeracje(ids, call, sc)
+            if fmt and ids:
+                stary, nowy = self.numeracja_formatu(fmt, sc, self.prefiks_wokol(call))
+                if nowy:
+                    self.zglos_numeracje(ids, call, sc)
+                elif stary:
+                    self.numeracja_zdegradowane += 1
 
     def on_sql_call(self, call, sc, helper):
         arg = call.args[0] if call.args else (_kw(call, "sql") or _kw(call, "query")
@@ -1250,7 +1402,10 @@ class AnalizatorModulu:
             m = _SQL_ZACZYNA.match(blank_sql(res[0])[0])
             if not m or m.group(1).lower() not in SQL_START:
                 return
-            ctx, surowe = analizuj_sql(res[0], self.cfg)
+            nazwy = list(self.hint) + [sc.qual.split(".")[-1].lower()]
+            ctx, surowe = analizuj_sql(res[0], self.cfg, nazwy)
+            self.numeracja_zdegradowane += ctx.numeracja_zdegradowane
+            self.trafione |= ctx.trafione
             self.sql_wywolan += 1
             if ctx.czy_sql_z_czasem():
                 self.sql_czas += 1
@@ -1313,15 +1468,35 @@ class AnalizatorModulu:
     def _naiwne(self, ids):
         return sorted(i for i in ids if self.czas[i].naiwny)
 
-    def numeracja_formatu(self, fmt, sc):
-        rok = re.search(r"%[Yy]", fmt)
-        mies = re.search(r"%[mbB]", fmt)
-        if not (rok and mies):
-            return False
-        if re.search(r"%[dHMSjaAIpf]", fmt):
-            nazwy = list(self.hint) + [sc.qual.split(".")[-1].lower()]
-            return any(_NAZWA_NUMERU.search(x) for x in nazwy)
-        return True
+    def numeracja_formatu(self, fmt, sc, prefiks):
+        """-> (stary, nowy): szeroka reguła z rundy 1 i zawężona (identyfikator dokumentu)."""
+        if not (re.search(r"%[Yy]", fmt) and re.search(r"%[mbB]", fmt)):
+            return False, False
+        nazwy = list(self.hint) + [sc.qual.split(".")[-1].lower()]
+        stary = (not re.search(r"%[dHMSjaAIpf]", fmt)) or any(_NAZWA_NUMERU.search(x) for x in nazwy)
+        return stary, bool(prefiks or nazwa_identyfikatora(nazwy))
+
+    @staticmethod
+    def _prefiks_w(stale):
+        return any(isinstance(c, ast.Constant) and isinstance(c.value, str) and _PREFIKS_DOK.match(c.value)
+                   for c in stale)
+
+    def prefiks_wokol(self, node):
+        """Czy wartość jest składana z literałem prefiksu dokumentu ("ZAM/", "FV/")."""
+        cur = node
+        while True:
+            p = self.rodzic.get(id(cur))
+            if isinstance(p, ast.BinOp) and isinstance(p.op, (ast.Add, ast.Mod)):
+                if self._prefiks_w([p.left, p.right]):
+                    return True
+            elif isinstance(p, ast.FormattedValue):
+                p = self.rodzic.get(id(p))
+                if isinstance(p, ast.JoinedStr) and self._prefiks_w(p.values):
+                    return True
+                return False
+            else:
+                return False
+            cur = p
 
     def zglos_numeracje(self, ids, node, sc):
         self.zuzyte.update(ids)
@@ -1330,6 +1505,7 @@ class AnalizatorModulu:
     def on_fstring(self, js, sc):
         atrybuty = set()
         ids_atr = set()
+        prefiks = self._prefiks_w(js.values)
         for v in js.values:
             if not isinstance(v, ast.FormattedValue):
                 continue
@@ -1338,14 +1514,21 @@ class AnalizatorModulu:
                 continue
             if v.format_spec is not None:
                 fmt = "".join(str(x.value) for x in v.format_spec.values if isinstance(x, ast.Constant))
-                if self.numeracja_formatu(fmt, sc):
+                stary, nowy = self.numeracja_formatu(fmt, sc, prefiks)
+                if nowy:
                     self.zglos_numeracje(ids, js, sc)
                     return
+                if stary:
+                    self.numeracja_zdegradowane += 1
             if isinstance(v.value, ast.Attribute) and v.value.attr in ("year", "month"):
                 atrybuty.add(v.value.attr)
                 ids_atr.update(ids)
         if atrybuty == {"year", "month"}:
-            self.zglos_numeracje(sorted(ids_atr), js, sc)
+            nazwy = list(self.hint) + [sc.qual.split(".")[-1].lower()]
+            if prefiks or nazwa_identyfikatora(nazwy):
+                self.zglos_numeracje(sorted(ids_atr), js, sc)
+            else:
+                self.numeracja_zdegradowane += 1
 
     # ----- harmonogramy
     def sprawdz_harmonogram(self, call, sc):
@@ -1400,12 +1583,14 @@ class AnalizatorModulu:
                 continue
             i = id(node)
             testowy = self.czy_testowy(qual)
-            if not testowy and i in self.uzycie_sql:
-                self.dodaj("py_naive_now", qual, node.lineno, "", self.segment(node),
-                           "likely" if self.uzycie_sql[i] else "uncertain")
-            elif not testowy and i in self.uzycie_db:
-                self.dodaj("py_naive_now", qual, node.lineno, "", self.segment(node),
-                           "likely" if self.uzycie_db[i] else "uncertain")
+            if not testowy and (i in self.uzycie_sql or i in self.uzycie_db):
+                pewna = self.uzycie_sql.get(i) or self.uzycie_db.get(i)
+                if i in self.domyslne:
+                    self.dodaj("py_naive_now", qual, node.lineno, "", self.segment(node),
+                               "likely" if pewna else "uncertain", "srednia", OPIS_DOMYSLNEJ)
+                else:
+                    self.dodaj("py_naive_now", qual, node.lineno, "", self.segment(node),
+                               "likely" if pewna else "uncertain")
             else:
                 self.dodaj("py_naive_now_other", qual, node.lineno, "", self.segment(node), "uncertain")
 
@@ -1507,6 +1692,7 @@ def zbierz_pliki(backend, wykluczenia=(), files_from=None, ostrzez=None):
 def audyt(backend, cfg, wykluczenia=(), files_from=None, ostrzez=None):
     ostrzez = ostrzez or (lambda m: None)
     raport = Raport()
+    raport.kolumn_tz, raport.kolumn_local = len(cfg.tz), len(cfg.local)
     for rel, fiz in zbierz_pliki(backend, wykluczenia, files_from, ostrzez):
         try:
             tekst = czytaj_tekst(fiz)
@@ -1524,6 +1710,8 @@ def audyt(backend, cfg, wykluczenia=(), files_from=None, ostrzez=None):
         a.uruchom()
         for w in sorted(set(a.wyniki_ostrzezenia)):
             ostrzez(w)
+        raport.numeracja_zawezona += a.numeracja_zdegradowane
+        raport.trafione |= a.trafione
         raport.pliki.append(StatPliku(rel, a.sql_wywolan, a.sql_czas, len(a.wyniki)))
         raport.wyniki.extend(a.wyniki)
     raport.wyniki.sort(key=lambda w: (WAZNOSCI.index(w.waznosc), w.plik, w.linia, w.kategoria, w.fragment))
@@ -1583,11 +1771,16 @@ def podsumuj(raport):
         "Wywołania SQL: %d (z funkcjami czasu: %d)" % (sql, sql_czas),
         "Wyniki: %d (nowe: %d, znane z baseline: %d)" % (len(raport.wyniki), nowe, len(raport.wyniki) - nowe),
         "Nowe wyniki blokujące (kod wyjścia 1): %d" % blok,
-        "",
-        "Rozkład kategorii:",
+        "Zawężenie numbering_by_date: %d wyników przestało być numbering_by_date (trafiają do zwykłych kategorii)"
+        % raport.numeracja_zawezona,
     ]
+    if raport.kolumn_tz or raport.kolumn_local:
+        linie.append("Kolumny z plików dopasowane w analizowanym SQL: systemowe %d/%d, lokalne %d/%d" % (
+            sum(1 for r, _ in raport.trafione if r == "tz"), raport.kolumn_tz,
+            sum(1 for r, _ in raport.trafione if r == "local"), raport.kolumn_local))
+    linie += ["", "Rozkład kategorii:"]
     for kat in KATEGORIE:
-        linie.append("  %-24s %-10s %d" % (kat, KATEGORIE[kat][0], licznik.get(kat, 0)))
+        linie.append("  %-26s %-10s %d" % (kat, KATEGORIE[kat][0], licznik.get(kat, 0)))
     return linie
 
 
@@ -1646,6 +1839,13 @@ def json_raportu(raport):
             ("wyniki", len(raport.wyniki)),
             ("nowe", nowe),
             ("znane", len(raport.wyniki) - nowe),
+            ("numbering_zawezone", raport.numeracja_zawezona),
+            ("kolumny_dopasowane", OrderedDict([
+                ("systemowe", sum(1 for r, _ in raport.trafione if r == "tz")),
+                ("systemowe_z_pliku", raport.kolumn_tz),
+                ("lokalne", sum(1 for r, _ in raport.trafione if r == "local")),
+                ("lokalne_z_pliku", raport.kolumn_local),
+            ])),
             ("nowe_blokujace", sum(1 for w in raport.wyniki if w.nowy and w.kategoria in KATEGORIE_BLOKUJACE)),
             ("kategorie", OrderedDict((k, licznik.get(k, 0)) for k in KATEGORIE)),
         ])),

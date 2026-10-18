@@ -1,4 +1,6 @@
 """Raporty sprzedaży (fikcyjne)."""
+from datetime import datetime
+
 from db import query_all
 
 
@@ -28,3 +30,10 @@ def epoch_is_fine():
 def by_alias():
     sql = "SELECT o.id FROM orders o WHERE DATE(o.paid_at) = %s"
     return query_all(sql, ("x",))
+
+
+def monthly_report(request):
+    month = request.args.get("month")
+    if not month:
+        month = datetime.now().strftime("%Y-%m")
+    return query_all("SELECT count(*) FROM orders WHERE to_char(created_at, 'YYYY-MM') = %s", (month,))
