@@ -246,7 +246,8 @@ class NumberingPython(unittest.TestCase):
         from datetime import date
         def f():
             d = date.today()
-            return f"{d.year}/{d.month:02d}"
+            nr = f"{d.year}/{d.month:02d}"
+            return nr
         """
         self.assertEqual(kategorie(src), ["numbering_by_date"])
 

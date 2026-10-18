@@ -139,6 +139,7 @@ class Raport:
     pliki: list = field(default_factory=list)
     wyniki: list = field(default_factory=list)
     pominiete: list = field(default_factory=list)
+    numeracja_zawezona: int = 0
 
 
 def normalizuj(tekst):
@@ -491,7 +492,8 @@ _BETWEEN_BEFORE = re.compile(
 
 _LIT = (r"(?:(?:date|timestamp|timestamptz)\s+)?'(\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)?)'"
         r"(?:\s*::\s*(?:date|timestamp|timestamptz))?")
-_COL = r"((?:%s\s*\.\s*)?%s)" % (_IDENT, _IDENT)
+_CHAIN_PATTERN = r"(?:%s\s*\.\s*)?%s" % (_IDENT, _IDENT)
+_COL = r"(%s)" % _CHAIN_PATTERN
 _CMP = r"(?:<=|>=|<>|!=|=|<|>)"
 _LIT_FWD = re.compile(_COL + r"\s*" + _CMP + r"\s*" + _LIT, re.I)
 _LIT_REV = re.compile(_LIT + r"\s*" + _CMP + r"\s*" + _COL + r"(?![\w$])(?!\s*[.(])", re.I)
@@ -616,9 +618,55 @@ def _pewnosc(kolumny_rodzaj):
     return "likely" if any(p for _, p, _ in kolumny_rodzaj) else "uncertain"
 
 
-def analizuj_sql(sql, cfg):
-    """-> lista surowych wyników (kategoria, start, koniec, pewnosc, kontekst)."""
+_NAZWA_ID = re.compile(r"numer|(?<![a-z])nr(?![a-z])|number|seq|prefix|numeracja|invoice|order_no", re.I)
+_PREFIKS_DOK = re.compile(r"[A-Z]{1,8}[/\-_.]")
+
+
+def nazwa_identyfikatora(nazwy):
+    return any(_NAZWA_ID.search(n or "") for n in nazwy)
+
+
+def _kolumna_insertu(skel, pos):
+    """Nazwa kolumny, do której trafia wartość z pozycji ``pos`` w INSERT ... VALUES (...)."""
+    for m in re.finditer(r"\binsert\s+into\s+[\w$.\"]+\s*\(([^)]*)\)\s*values\s*\(", skel, re.I):
+        o = m.end() - 1
+        c = _match_fwd(skel, o)
+        if c < 0 or not (o < pos < c):
+            continue
+        kol = [x.strip().strip('"').lower() for x in m.group(1).split(",")]
+        for i, (a, b) in enumerate(_split_top(skel, o + 1, c)):
+            if a <= pos < b:
+                return kol[i] if i < len(kol) else None
+    return None
+
+
+def _numeracja_sql(skel, code, start, koniec, nazwy):
+    """Czy wynik to_char(teraz, ...) WCHODZI W IDENTYFIKATOR dokumentu."""
+    if nazwa_identyfikatora(nazwy):
+        return True
+    przed = re.search(r"'([^']*)'\s*(?:\|\||,)\s*$", code[:start])
+    if przed and _PREFIKS_DOK.match(przed.group(1)):
+        return True
+    po = re.match(r"\s*\|\|\s*'([^']*)'", code[koniec:])
+    if po and _PREFIKS_DOK.match(po.group(1)):
+        return True
+    lewa = re.search(r"(%s)\s*(?:=|like|ilike)\s*(?:'[^']*'\s*\|\|\s*)*$" % _CHAIN_PATTERN, skel[:start], re.I)
+    if lewa and nazwa_identyfikatora([lewa.group(1).split(".")[-1]]):
+        return True
+    prawa = re.match(r"\s*(?:\|\|\s*'[^']*'\s*)*(?:=|like|ilike)\s*(%s)" % _CHAIN_PATTERN, skel[koniec:], re.I)
+    if prawa and nazwa_identyfikatora([prawa.group(1).split(".")[-1]]):
+        return True
+    kol = _kolumna_insertu(skel, start)
+    return bool(kol and nazwa_identyfikatora([kol]))
+
+
+def analizuj_sql(sql, cfg, nazwy=()):
+    """-> (kontekst, lista surowych wyników (kategoria, start, koniec, pewnosc)).
+
+    ``nazwy``: nazwy zmiennych/funkcji wokół wywołania (podpowiedź dla numeracji dokumentów).
+    """
     ctx = KontekstSql(sql, cfg)
+    ctx.numeracja_zdegradowane = 0
     skel, code = ctx.skel, ctx.code
     surowe = []
     spany_numeracji = []
@@ -637,8 +685,13 @@ def analizuj_sql(sql, cfg):
         fmt = code[a1[0]:a1[1]]
         if _NOWISH.search(pierwszy) and not _TZ_MARK.search(pierwszy) \
                 and re.search(r"y{2,4}|mm|month|mon", fmt, re.I):
-            surowe.append(("numbering_by_date", m.start(), c + 1, "likely"))
-            spany_numeracji.append((m.start(), c + 1))
+            if _numeracja_sql(skel, code, m.start(), c + 1, nazwy):
+                surowe.append(("numbering_by_date", m.start(), c + 1, "likely"))
+                spany_numeracji.append((m.start(), c + 1))
+            else:
+                ctx.numeracja_zdegradowane += 1
+                if not _CUR_DATE_RE.search(pierwszy):  # NOW()/CURRENT_TIMESTAMP: data liczona w UTC
+                    surowe.append(("sql_current_date_utc", m.start(), c + 1, "likely"))
 
     def w_numeracji(p):
         return any(a <= p < b for a, b in spany_numeracji)
@@ -773,9 +826,13 @@ def analizuj_sql(sql, cfg):
         lewy = operand_before(skel, m.start())
         if not lewy:
             continue
+        # arytmetyka na samym NOW() (także po AT TIME ZONE) to okno czasowe, nie przesunięcie strefy;
+        # flagujemy tylko interwał dodany do KOLUMNY czasu
+        if not ctx.kolumny(lewy[0], lewy[1]):
+            continue
         if _ma_strefe(skel, lewy[0], lewy[1]) or _TZ_AFTER.match(skel, m.end()):
             surowe.append(("sql_fixed_offset", lewy[0], m.end(), "likely"))
-        elif ctx.kolumny(lewy[0], lewy[1]):
+        else:
             surowe.append(("sql_fixed_offset", lewy[0], m.end(), "uncertain"))
 
     kategorie = OrderedDict()
@@ -880,6 +937,7 @@ class AnalizatorModulu:
         self.uzycie_db = {}
         self.zuzyte = set()
         self.bez_cron = set()
+        self.numeracja_zdegradowane = 0
         self.wyniki_ostrzezenia = []
         self._przygotuj()
 
@@ -893,6 +951,10 @@ class AnalizatorModulu:
                 for a in n.names:
                     if a.name != "*":
                         self.importy[a.asname or a.name] = n.module + "." + a.name
+        self.rodzic = {}
+        for p in ast.walk(self.tree):
+            for ch in ast.iter_child_nodes(p):
+                self.rodzic[id(ch)] = p
         self.func_ids = set(id(c.func) for c in ast.walk(self.tree) if isinstance(c, ast.Call))
         for n in ast.walk(self.tree):
             if isinstance(n, ast.Call):
@@ -1238,8 +1300,12 @@ class AnalizatorModulu:
         if isinstance(call.func, ast.Attribute) and call.func.attr == "strftime" and call.args:
             fmt = _stala_tekst(call.args[0])
             ids = self._naiwne(self.czasy_w(call.func.value, sc))
-            if fmt and ids and self.numeracja_formatu(fmt, sc):
-                self.zglos_numeracje(ids, call, sc)
+            if fmt and ids:
+                stary, nowy = self.numeracja_formatu(fmt, sc, self.prefiks_wokol(call))
+                if nowy:
+                    self.zglos_numeracje(ids, call, sc)
+                elif stary:
+                    self.numeracja_zdegradowane += 1
 
     def on_sql_call(self, call, sc, helper):
         arg = call.args[0] if call.args else (_kw(call, "sql") or _kw(call, "query")
@@ -1250,7 +1316,9 @@ class AnalizatorModulu:
             m = _SQL_ZACZYNA.match(blank_sql(res[0])[0])
             if not m or m.group(1).lower() not in SQL_START:
                 return
-            ctx, surowe = analizuj_sql(res[0], self.cfg)
+            nazwy = list(self.hint) + [sc.qual.split(".")[-1].lower()]
+            ctx, surowe = analizuj_sql(res[0], self.cfg, nazwy)
+            self.numeracja_zdegradowane += ctx.numeracja_zdegradowane
             self.sql_wywolan += 1
             if ctx.czy_sql_z_czasem():
                 self.sql_czas += 1
@@ -1313,15 +1381,35 @@ class AnalizatorModulu:
     def _naiwne(self, ids):
         return sorted(i for i in ids if self.czas[i].naiwny)
 
-    def numeracja_formatu(self, fmt, sc):
-        rok = re.search(r"%[Yy]", fmt)
-        mies = re.search(r"%[mbB]", fmt)
-        if not (rok and mies):
-            return False
-        if re.search(r"%[dHMSjaAIpf]", fmt):
-            nazwy = list(self.hint) + [sc.qual.split(".")[-1].lower()]
-            return any(_NAZWA_NUMERU.search(x) for x in nazwy)
-        return True
+    def numeracja_formatu(self, fmt, sc, prefiks):
+        """-> (stary, nowy): szeroka reguła z rundy 1 i zawężona (identyfikator dokumentu)."""
+        if not (re.search(r"%[Yy]", fmt) and re.search(r"%[mbB]", fmt)):
+            return False, False
+        nazwy = list(self.hint) + [sc.qual.split(".")[-1].lower()]
+        stary = (not re.search(r"%[dHMSjaAIpf]", fmt)) or any(_NAZWA_NUMERU.search(x) for x in nazwy)
+        return stary, bool(prefiks or nazwa_identyfikatora(nazwy))
+
+    @staticmethod
+    def _prefiks_w(stale):
+        return any(isinstance(c, ast.Constant) and isinstance(c.value, str) and _PREFIKS_DOK.match(c.value)
+                   for c in stale)
+
+    def prefiks_wokol(self, node):
+        """Czy wartość jest składana z literałem prefiksu dokumentu ("ZAM/", "FV/")."""
+        cur = node
+        while True:
+            p = self.rodzic.get(id(cur))
+            if isinstance(p, ast.BinOp) and isinstance(p.op, (ast.Add, ast.Mod)):
+                if self._prefiks_w([p.left, p.right]):
+                    return True
+            elif isinstance(p, ast.FormattedValue):
+                p = self.rodzic.get(id(p))
+                if isinstance(p, ast.JoinedStr) and self._prefiks_w(p.values):
+                    return True
+                return False
+            else:
+                return False
+            cur = p
 
     def zglos_numeracje(self, ids, node, sc):
         self.zuzyte.update(ids)
@@ -1330,6 +1418,7 @@ class AnalizatorModulu:
     def on_fstring(self, js, sc):
         atrybuty = set()
         ids_atr = set()
+        prefiks = self._prefiks_w(js.values)
         for v in js.values:
             if not isinstance(v, ast.FormattedValue):
                 continue
@@ -1338,14 +1427,21 @@ class AnalizatorModulu:
                 continue
             if v.format_spec is not None:
                 fmt = "".join(str(x.value) for x in v.format_spec.values if isinstance(x, ast.Constant))
-                if self.numeracja_formatu(fmt, sc):
+                stary, nowy = self.numeracja_formatu(fmt, sc, prefiks)
+                if nowy:
                     self.zglos_numeracje(ids, js, sc)
                     return
+                if stary:
+                    self.numeracja_zdegradowane += 1
             if isinstance(v.value, ast.Attribute) and v.value.attr in ("year", "month"):
                 atrybuty.add(v.value.attr)
                 ids_atr.update(ids)
         if atrybuty == {"year", "month"}:
-            self.zglos_numeracje(sorted(ids_atr), js, sc)
+            nazwy = list(self.hint) + [sc.qual.split(".")[-1].lower()]
+            if prefiks or nazwa_identyfikatora(nazwy):
+                self.zglos_numeracje(sorted(ids_atr), js, sc)
+            else:
+                self.numeracja_zdegradowane += 1
 
     # ----- harmonogramy
     def sprawdz_harmonogram(self, call, sc):
@@ -1524,6 +1620,7 @@ def audyt(backend, cfg, wykluczenia=(), files_from=None, ostrzez=None):
         a.uruchom()
         for w in sorted(set(a.wyniki_ostrzezenia)):
             ostrzez(w)
+        raport.numeracja_zawezona += a.numeracja_zdegradowane
         raport.pliki.append(StatPliku(rel, a.sql_wywolan, a.sql_czas, len(a.wyniki)))
         raport.wyniki.extend(a.wyniki)
     raport.wyniki.sort(key=lambda w: (WAZNOSCI.index(w.waznosc), w.plik, w.linia, w.kategoria, w.fragment))
@@ -1583,6 +1680,8 @@ def podsumuj(raport):
         "Wywołania SQL: %d (z funkcjami czasu: %d)" % (sql, sql_czas),
         "Wyniki: %d (nowe: %d, znane z baseline: %d)" % (len(raport.wyniki), nowe, len(raport.wyniki) - nowe),
         "Nowe wyniki blokujące (kod wyjścia 1): %d" % blok,
+        "Zawężenie numbering_by_date: %d wyników przestało być numbering_by_date (trafiają do zwykłych kategorii)"
+        % raport.numeracja_zawezona,
         "",
         "Rozkład kategorii:",
     ]
@@ -1646,6 +1745,7 @@ def json_raportu(raport):
             ("wyniki", len(raport.wyniki)),
             ("nowe", nowe),
             ("znane", len(raport.wyniki) - nowe),
+            ("numbering_zawezone", raport.numeracja_zawezona),
             ("nowe_blokujace", sum(1 for w in raport.wyniki if w.nowy and w.kategoria in KATEGORIE_BLOKUJACE)),
             ("kategorie", OrderedDict((k, licznik.get(k, 0)) for k in KATEGORIE)),
         ])),
