@@ -37,3 +37,12 @@ def monthly_report(request):
     if not month:
         month = datetime.now().strftime("%Y-%m")
     return query_all("SELECT count(*) FROM orders WHERE to_char(created_at, 'YYYY-MM') = %s", (month,))
+
+
+def monthly_report_else(request):
+    month = request.args.get("month")
+    if month:
+        pass
+    else:
+        month = datetime.now().strftime("%Y-%m")
+    return query_all("SELECT count(*) FROM orders WHERE to_char(created_at, 'YYYY-MM') = %s", (month,))

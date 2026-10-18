@@ -24,3 +24,8 @@ def storage_key(name):
 
 def birthday_customers(query_all):
     return query_all("SELECT id FROM customers WHERE to_char(born_on, 'MM-DD') = to_char(CURRENT_DATE, 'MM-DD')")
+
+
+def log_today():
+    today = datetime.now()
+    log.info("dzis %s, rok %s", today, today.year)

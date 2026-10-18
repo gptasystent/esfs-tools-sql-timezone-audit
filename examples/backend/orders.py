@@ -30,3 +30,8 @@ def close_overdue():
 def is_overdue(order_id):
     row = query_one("SELECT due_date FROM orders WHERE id = %s", (order_id,))
     return row[0] < datetime.now()
+
+
+def next_invoice_number(seq):
+    today = datetime.now()
+    return f"FV/{today.year}/{seq}"
