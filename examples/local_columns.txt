@@ -1,0 +1,5 @@
+# kolumny lokalne (timestamp bez strefy, czas wpisany ręcznie)
+starts_at
+scheduled_for
+due_date
+shifts.ends_at

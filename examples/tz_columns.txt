@@ -1,0 +1,5 @@
+# kolumny systemowe (timestamptz, UTC) - fikcyjny sklep z częściami
+created_at
+updated_at
+sent_at
+orders.paid_at
