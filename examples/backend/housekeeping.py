@@ -16,3 +16,11 @@ def log_start():
 def sql_in_text_is_fine():
     note = "SELECT CURRENT_DATE is only text here"
     return note
+
+
+def storage_key(name):
+    return f"uploads/{date.today():%Y/%m}/{name}"
+
+
+def birthday_customers(query_all):
+    return query_all("SELECT id FROM customers WHERE to_char(born_on, 'MM-DD') = to_char(CURRENT_DATE, 'MM-DD')")

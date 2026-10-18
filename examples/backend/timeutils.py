@@ -21,3 +21,7 @@ def now_local():
 
 def save_stamp():
     return query_all("UPDATE parts SET updated_at = now() WHERE id = 1")
+
+
+def last_hour_local():
+    return query_all("SELECT id FROM orders WHERE paid_at > (NOW() AT TIME ZONE 'Europe/Warsaw') - INTERVAL '1 hour'")

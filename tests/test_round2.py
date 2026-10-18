@@ -155,3 +155,130 @@ class NumberingNarrowed(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UtcIntoLocalColumn(unittest.TestCase):
+    def test_update_set_local_column(self):
+        w = sql("UPDATE shifts SET starts_at = NOW() WHERE id = 1")
+        self.assertEqual([(x.kategoria, x.pewnosc, x.waznosc) for x in w],
+                         [("sql_utc_into_local_column", "likely", "wysoka")])
+
+    def test_insert_into_local_column(self):
+        self.assertEqual(sql_kat("INSERT INTO shifts (id, starts_at) VALUES (1, now())"),
+                         ["sql_utc_into_local_column"])
+
+    def test_insert_current_timestamp_other_column_ok(self):
+        self.assertEqual(sql_kat("INSERT INTO shifts (starts_at, created_at) VALUES ('x', current_timestamp)"), [])
+
+    def test_system_column_is_correct(self):
+        self.assertEqual(sql_kat("UPDATE shifts SET updated_at = NOW(), sent_at = CURRENT_TIMESTAMP WHERE id = 1"), [])
+
+    def test_system_column_insert_is_correct(self):
+        self.assertEqual(sql_kat("INSERT INTO shifts (id, created_at) VALUES (1, now())"), [])
+
+    def test_set_with_at_time_zone_ok(self):
+        self.assertEqual(sql_kat("UPDATE shifts SET starts_at = NOW() AT TIME ZONE 'Europe/Warsaw' WHERE id = 1"), [])
+
+    def test_second_assignment_in_set(self):
+        self.assertEqual(sql_kat("UPDATE shifts SET note = 'x', scheduled_for = now() + interval '1 day' WHERE id = 1"),
+                         ["sql_utc_into_local_column"])
+
+    def test_on_conflict_do_update(self):
+        self.assertEqual(sql_kat(
+            "INSERT INTO shifts (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET starts_at = now()"),
+            ["sql_utc_into_local_column"])
+
+    def test_where_comparison_is_still_local_vs_now(self):
+        self.assertEqual(sql_kat("UPDATE shifts SET note = 'x' WHERE starts_at < now()"), ["sql_local_vs_now"])
+
+    def test_set_is_not_reported_as_comparison_too(self):
+        self.assertEqual(sql_kat("UPDATE shifts SET starts_at = NOW() WHERE id = 1"), ["sql_utc_into_local_column"])
+
+    def test_heuristic_local_column_uncertain(self):
+        w = wyniki('def f(cur):\n    cur.execute("UPDATE shifts SET starts_at = NOW()")\n', tz=[], local=[])
+        self.assertEqual([(x.kategoria, x.pewnosc) for x in w], [("sql_utc_into_local_column", "uncertain")])
+
+    def test_blocking_category(self):
+        self.assertIn("sql_utc_into_local_column", sta.KATEGORIE_BLOKUJACE)
+
+
+class DefaultParameterValue(unittest.TestCase):
+    SRC = """
+    from datetime import datetime
+    def report(request, q):
+        month = request.args.get("month")
+        if not month:
+            month = datetime.now().strftime("%Y-%m")
+        return q.query_all("SELECT 1 FROM t WHERE to_char(created_at, 'YYYY-MM') = %s", (month,))
+    """
+
+    def test_stays_py_naive_now_with_medium_severity(self):
+        w = wyniki(self.SRC)
+        self.assertEqual([(x.kategoria, x.waznosc) for x in w], [("py_naive_now", "srednia")])
+
+    def test_explains_default_value(self):
+        self.assertIn("wartość domyślna parametru", wyniki(self.SRC)[0].dlaczego)
+
+    def test_or_default_form(self):
+        src = """
+        from datetime import date
+        def report(request, q):
+            day = request.args.get("day") or date.today().isoformat()
+            return q.query_all("SELECT 1 FROM t WHERE d = %s", (day,))
+        """
+        w = wyniki(src)
+        self.assertEqual([(x.kategoria, x.waznosc) for x in w], [("py_naive_now", "srednia")])
+
+    def test_plain_naive_now_in_sql_keeps_high(self):
+        src = """
+        from datetime import datetime
+        def f(q):
+            q.query_all("SELECT 1 FROM t WHERE x < %s", (datetime.now(),))
+        """
+        w = wyniki(src)
+        self.assertEqual([(x.kategoria, x.waznosc) for x in w], [("py_naive_now", "wysoka")])
+        self.assertNotIn("wartość domyślna", w[0].dlaczego)
+
+    def test_default_not_used_in_sql_is_other(self):
+        src = """
+        from datetime import datetime
+        def f(request):
+            m = request.args.get("m")
+            if not m:
+                m = datetime.now().strftime("%Y-%m")
+            return m
+        """
+        self.assertEqual(kategorie(src), ["py_naive_now_other"])
+
+
+class ColumnFileMatchSummary(unittest.TestCase):
+    def raport(self, src, tz, local):
+        import tempfile, os
+        d = tempfile.mkdtemp()
+        with open(os.path.join(d, "a.py"), "w") as f:
+            f.write(src)
+        return sta.audyt(d, sta.KonfiguracjaKolumn(tz, local))
+
+    SRC = ('def f(cur):\n    cur.execute("SELECT created_at, starts_at FROM shifts s '
+           'WHERE s.ends_at < NOW() AND paid_at IS NULL")\n')
+
+    def test_counts_matched_columns(self):
+        r = self.raport(self.SRC, ["created_at", "updated_at", "orders.paid_at", "shifts.paid_at"],
+                        ["starts_at", "shifts.ends_at", "due_date"])
+        linie = [l for l in sta.podsumuj(r) if l.startswith("Kolumny z plików")]
+        self.assertEqual(linie, ["Kolumny z plików dopasowane w analizowanym SQL: "
+                                 "systemowe 2/4, lokalne 2/3"])
+
+    def test_no_line_without_column_files(self):
+        r = self.raport(self.SRC, [], [])
+        self.assertFalse([l for l in sta.podsumuj(r) if l.startswith("Kolumny z plików")])
+
+    def test_zero_match_is_visible(self):
+        r = self.raport(self.SRC, ["nic_takiego"], ["nic_innego"])
+        self.assertIn("systemowe 0/1, lokalne 0/1", "\n".join(sta.podsumuj(r)))
+
+    def test_in_json(self):
+        r = self.raport(self.SRC, ["created_at"], ["starts_at"])
+        dane = __import__("json").loads(sta.json_raportu(r))["podsumowanie"]
+        self.assertEqual(dane["kolumny_dopasowane"], {"systemowe": 1, "systemowe_z_pliku": 1,
+                                                      "lokalne": 1, "lokalne_z_pliku": 1})

@@ -54,6 +54,11 @@ KATEGORIE = OrderedDict([
         "Sztywne przesunięcie godzinowe psuje się przy zmianie czasu (ostatnie niedziele "
         "marca i października).",
         "Zamień przesunięcie na AT TIME ZONE 'Europe/Warsaw'.")),
+    ("sql_utc_into_local_column", (
+        "wysoka",
+        "NOW()/CURRENT_TIMESTAMP (UTC) zapisywane do kolumny lokalnej (timestamp bez strefy): "
+        "kolumna ma przechowywać czas ze ściany zegara, a dostaje UTC.",
+        "Zapisz NOW() AT TIME ZONE 'Europe/Warsaw' albo zmień kolumnę na timestamptz.")),
     ("py_naive_now", (
         "wysoka",
         "Naiwny \"teraz/dziś\" (bez tzinfo) trafia do SQL albo jest porównywany z wartością "
@@ -87,14 +92,17 @@ KATEGORIE = OrderedDict([
 
 KATEGORIE_BLOKUJACE = frozenset([
     "sql_current_date_utc", "sql_local_vs_now", "sql_date_trunc_utc",
-    "py_naive_now", "scheduler_no_timezone", "numbering_by_date",
+    "py_naive_now", "scheduler_no_timezone", "numbering_by_date", "sql_utc_into_local_column",
 ])
 
 # kolejność w sekcji "najpierw napraw" (od największego ryzyka)
-KOLEJNOSC_RYZYKA = ("numbering_by_date", "scheduler_no_timezone", "sql_current_date_utc",
-                    "sql_local_vs_now", "sql_date_trunc_utc", "py_naive_now")
+KOLEJNOSC_RYZYKA = ("numbering_by_date", "scheduler_no_timezone", "sql_utc_into_local_column",
+                    "sql_current_date_utc", "sql_local_vs_now", "sql_date_trunc_utc", "py_naive_now")
 
 MAKS_FRAGMENT = 120
+
+OPIS_DOMYSLNEJ = ("To wartość domyślna parametru zapytania (np. miesiąc/dzień, gdy nie podano): "
+                  "błąd widać tylko tuż po północy czasu lokalnego.")
 
 
 # --------------------------------------------------------------------------- model
@@ -140,6 +148,9 @@ class Raport:
     wyniki: list = field(default_factory=list)
     pominiete: list = field(default_factory=list)
     numeracja_zawezona: int = 0
+    trafione: set = field(default_factory=set)
+    kolumn_tz: int = 0
+    kolumn_local: int = 0
 
 
 def normalizuj(tekst):
@@ -182,6 +193,18 @@ class KonfiguracjaKolumn:
     @classmethod
     def z_tekstow(cls, tz_tekst="", local_tekst=""):
         return cls(parsuj_liste_kolumn(tz_tekst), parsuj_liste_kolumn(local_tekst))
+
+    def dopasowania(self, tabele, kolumna):
+        """Wpisy z plików pasujące do kolumny: lista (rodzaj, wpis)."""
+        kolumna = kolumna.lower()
+        wynik = []
+        for rodzaj, zbior in (("tz", self.tz), ("local", self.local)):
+            for t in tabele:
+                if t + "." + kolumna in zbior:
+                    wynik.append((rodzaj, t + "." + kolumna))
+            if kolumna in zbior:
+                wynik.append((rodzaj, kolumna))
+        return wynik
 
     def classify(self, tabele, kolumna):
         """-> (rodzaj, pewne): rodzaj 'tz'/'local'/None, pewne=True gdy z plików wejściowych."""
@@ -522,6 +545,14 @@ class KontekstSql:
             if al and al.lower() not in SQL_KEYWORDS:
                 self.aliases[al.lower()] = tab
         self.maska = _maskuj_literaly(self.code, sql_single=True)
+        self.trafione = set()
+        if cfg.tz or cfg.local:
+            for m in _COLREF.finditer(self.skel):
+                if m.group(2).lower() in SQL_KEYWORDS:
+                    continue
+                q = m.group(1)
+                tabele = [self.aliases.get(q.lower(), q.lower())] if q else self.tabele
+                self.trafione.update(cfg.dopasowania(tabele, m.group(2)))
 
     def rodzaj(self, kwal, nazwa):
         if nazwa.lower() in SQL_KEYWORDS:
@@ -640,6 +671,22 @@ def _kolumna_insertu(skel, pos):
     return None
 
 
+def _kolumna_zapisu(skel, poz):
+    """Kolumna, do której zapisywana jest wartość z pozycji ``poz`` (INSERT ... VALUES lub SET kol = ...)."""
+    kol = _kolumna_insertu(skel, poz)
+    if kol:
+        return kol
+    pre = skel[:poz]
+    ostatni_set = max((m.start() for m in re.finditer(r"\bset\b", pre, re.I)), default=-1)
+    ostatni_where = max((m.start() for m in re.finditer(r"\bwhere\b", pre, re.I)), default=-1)
+    if ostatni_set < 0 or ostatni_set < ostatni_where:
+        return None
+    m = re.search(r"(%s)\s*=\s*(?:\(\s*)*$" % _CHAIN_PATTERN, pre)
+    if m and not pre[:m.start()].rstrip().endswith(("<", ">", "!")):
+        return m.group(1).split(".")[-1].lower()
+    return None
+
+
 def _numeracja_sql(skel, code, start, koniec, nazwy):
     """Czy wynik to_char(teraz, ...) WCHODZI W IDENTYFIKATOR dokumentu."""
     if nazwa_identyfikatora(nazwy):
@@ -729,6 +776,12 @@ def analizuj_sql(sql, cfg, nazwy=()):
                 e = post_m.end()
             else:
                 break
+        zapis = _kolumna_zapisu(skel, m.start())
+        if zapis:
+            rodzaj, pewne = ctx.rodzaj(None, zapis)
+            if rodzaj == "local":
+                surowe.append(("sql_utc_into_local_column", m.start(), e, "likely" if pewne else "uncertain"))
+            continue
         kolumny = []
         pre = skel[:s]
         mo = _OP_BEFORE.search(pre)
@@ -875,6 +928,7 @@ class Zakres:
         self.qual = qual
         self.env = dict(env) if env else {}
         self.deps = dict(deps) if deps else {}
+        self.getnames = set()
         self.taint = set(taint) if taint else set()
         self.cls = cls
         self.klasa = klasa
@@ -938,6 +992,8 @@ class AnalizatorModulu:
         self.zuzyte = set()
         self.bez_cron = set()
         self.numeracja_zdegradowane = 0
+        self.trafione = set()
+        self.domyslne = set()
         self.wyniki_ostrzezenia = []
         self._przygotuj()
 
@@ -1009,8 +1065,11 @@ class AnalizatorModulu:
             return type(node).__name__
         return _przytnij(_ws(tekst))
 
-    def dodaj(self, kategoria, qual, linia, helper, fragment, pewnosc):
+    def dodaj(self, kategoria, qual, linia, helper, fragment, pewnosc, waznosc=None, dlaczego_extra=""):
         waz, dlaczego, propozycja = KATEGORIE[kategoria]
+        waz = waznosc or waz
+        if dlaczego_extra:
+            dlaczego = dlaczego + " " + dlaczego_extra
         fragment = _przytnij(_ws(fragment))
         k = (qual, linia, kategoria, normalizuj(fragment))
         if k in self._widziane:
@@ -1058,6 +1117,11 @@ class AnalizatorModulu:
             self.hint = self._nazwy_celow(st)
             self.scan(st, sc)
             self.hint = []
+        elif isinstance(st, ast.If):
+            self.on_if(st, sc)
+            for _, wartosc in ast.iter_fields(st):
+                for it in (wartosc if isinstance(wartosc, list) else [wartosc]):
+                    self.visit_item(it, sc)
         elif isinstance(st, ast.Expr):
             self.on_expr_stmt(st, sc)
             self.scan(st, sc)
@@ -1219,6 +1283,13 @@ class AnalizatorModulu:
                     sc.env.pop(k, None)
         czasy = self.czasy_w(wartosc, sc)
         skaz = self.skazone(wartosc, sc)
+        if isinstance(wartosc, ast.Call) and isinstance(wartosc.func, ast.Attribute) and wartosc.func.attr == "get":
+            sc.getnames.update(proste)
+        elif isinstance(wartosc, ast.BoolOp) and isinstance(wartosc.op, ast.Or) and len(wartosc.values) > 1 \
+                and isinstance(wartosc.values[0], ast.Call) and isinstance(wartosc.values[0].func, ast.Attribute) \
+                and wartosc.values[0].func.attr == "get":
+            for v in wartosc.values[1:]:
+                self.domyslne |= self.czasy_w(v, sc)
         for nm in nazwy:
             if aug:
                 sc.deps[nm] = sc.deps.get(nm, set()) | czasy
@@ -1230,6 +1301,21 @@ class AnalizatorModulu:
                 sc.taint.add(nm)
             elif not aug:
                 sc.taint.discard(nm)
+
+    def on_if(self, st, sc):
+        """``if not x: x = <naiwne teraz>`` gdy x pochodzi z ``.get(...)`` - wartość domyślna parametru."""
+        t = st.test
+        nazwa = None
+        if isinstance(t, ast.UnaryOp) and isinstance(t.op, ast.Not) and isinstance(t.operand, ast.Name):
+            nazwa = t.operand.id
+        elif isinstance(t, ast.Compare) and isinstance(t.left, ast.Name) and len(t.comparators) == 1 \
+                and isinstance(t.comparators[0], ast.Constant) and t.comparators[0].value in (None, "") \
+                and isinstance(t.ops[0], (ast.Is, ast.Eq)):
+            nazwa = t.left.id
+        if nazwa and nazwa in sc.getnames:
+            for b in st.body:
+                if isinstance(b, ast.Assign) and any(isinstance(x, ast.Name) and x.id == nazwa for x in b.targets):
+                    self.domyslne |= self.czasy_w(b.value, sc)
 
     def on_expr_stmt(self, st, sc):
         v = st.value
@@ -1319,6 +1405,7 @@ class AnalizatorModulu:
             nazwy = list(self.hint) + [sc.qual.split(".")[-1].lower()]
             ctx, surowe = analizuj_sql(res[0], self.cfg, nazwy)
             self.numeracja_zdegradowane += ctx.numeracja_zdegradowane
+            self.trafione |= ctx.trafione
             self.sql_wywolan += 1
             if ctx.czy_sql_z_czasem():
                 self.sql_czas += 1
@@ -1496,12 +1583,14 @@ class AnalizatorModulu:
                 continue
             i = id(node)
             testowy = self.czy_testowy(qual)
-            if not testowy and i in self.uzycie_sql:
-                self.dodaj("py_naive_now", qual, node.lineno, "", self.segment(node),
-                           "likely" if self.uzycie_sql[i] else "uncertain")
-            elif not testowy and i in self.uzycie_db:
-                self.dodaj("py_naive_now", qual, node.lineno, "", self.segment(node),
-                           "likely" if self.uzycie_db[i] else "uncertain")
+            if not testowy and (i in self.uzycie_sql or i in self.uzycie_db):
+                pewna = self.uzycie_sql.get(i) or self.uzycie_db.get(i)
+                if i in self.domyslne:
+                    self.dodaj("py_naive_now", qual, node.lineno, "", self.segment(node),
+                               "likely" if pewna else "uncertain", "srednia", OPIS_DOMYSLNEJ)
+                else:
+                    self.dodaj("py_naive_now", qual, node.lineno, "", self.segment(node),
+                               "likely" if pewna else "uncertain")
             else:
                 self.dodaj("py_naive_now_other", qual, node.lineno, "", self.segment(node), "uncertain")
 
@@ -1603,6 +1692,7 @@ def zbierz_pliki(backend, wykluczenia=(), files_from=None, ostrzez=None):
 def audyt(backend, cfg, wykluczenia=(), files_from=None, ostrzez=None):
     ostrzez = ostrzez or (lambda m: None)
     raport = Raport()
+    raport.kolumn_tz, raport.kolumn_local = len(cfg.tz), len(cfg.local)
     for rel, fiz in zbierz_pliki(backend, wykluczenia, files_from, ostrzez):
         try:
             tekst = czytaj_tekst(fiz)
@@ -1621,6 +1711,7 @@ def audyt(backend, cfg, wykluczenia=(), files_from=None, ostrzez=None):
         for w in sorted(set(a.wyniki_ostrzezenia)):
             ostrzez(w)
         raport.numeracja_zawezona += a.numeracja_zdegradowane
+        raport.trafione |= a.trafione
         raport.pliki.append(StatPliku(rel, a.sql_wywolan, a.sql_czas, len(a.wyniki)))
         raport.wyniki.extend(a.wyniki)
     raport.wyniki.sort(key=lambda w: (WAZNOSCI.index(w.waznosc), w.plik, w.linia, w.kategoria, w.fragment))
@@ -1682,11 +1773,14 @@ def podsumuj(raport):
         "Nowe wyniki blokujące (kod wyjścia 1): %d" % blok,
         "Zawężenie numbering_by_date: %d wyników przestało być numbering_by_date (trafiają do zwykłych kategorii)"
         % raport.numeracja_zawezona,
-        "",
-        "Rozkład kategorii:",
     ]
+    if raport.kolumn_tz or raport.kolumn_local:
+        linie.append("Kolumny z plików dopasowane w analizowanym SQL: systemowe %d/%d, lokalne %d/%d" % (
+            sum(1 for r, _ in raport.trafione if r == "tz"), raport.kolumn_tz,
+            sum(1 for r, _ in raport.trafione if r == "local"), raport.kolumn_local))
+    linie += ["", "Rozkład kategorii:"]
     for kat in KATEGORIE:
-        linie.append("  %-24s %-10s %d" % (kat, KATEGORIE[kat][0], licznik.get(kat, 0)))
+        linie.append("  %-26s %-10s %d" % (kat, KATEGORIE[kat][0], licznik.get(kat, 0)))
     return linie
 
 
@@ -1746,6 +1840,12 @@ def json_raportu(raport):
             ("nowe", nowe),
             ("znane", len(raport.wyniki) - nowe),
             ("numbering_zawezone", raport.numeracja_zawezona),
+            ("kolumny_dopasowane", OrderedDict([
+                ("systemowe", sum(1 for r, _ in raport.trafione if r == "tz")),
+                ("systemowe_z_pliku", raport.kolumn_tz),
+                ("lokalne", sum(1 for r, _ in raport.trafione if r == "local")),
+                ("lokalne_z_pliku", raport.kolumn_local),
+            ])),
             ("nowe_blokujace", sum(1 for w in raport.wyniki if w.nowy and w.kategoria in KATEGORIE_BLOKUJACE)),
             ("kategorie", OrderedDict((k, licznik.get(k, 0)) for k in KATEGORIE)),
         ])),

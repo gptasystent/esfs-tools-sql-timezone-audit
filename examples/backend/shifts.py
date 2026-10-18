@@ -1,5 +1,5 @@
 """Zmiany pracowników magazynu (fikcyjne)."""
-from db import query_all
+from db import execute, query_all
 
 UPCOMING_SQL = """
     SELECT id, starts_at
@@ -21,3 +21,11 @@ def late_shifts():
 def shifts_local_ok():
     return query_all(
         "SELECT id FROM shifts WHERE starts_at > NOW() AT TIME ZONE 'Europe/Warsaw'")
+
+
+def restart_shift(shift_id):
+    execute("UPDATE shifts SET starts_at = NOW() WHERE id = %s", (shift_id,))
+
+
+def touch_shift(shift_id):
+    execute("UPDATE shifts SET updated_at = NOW() WHERE id = %s", (shift_id,))
