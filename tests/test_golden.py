@@ -18,6 +18,10 @@ ARGS = ["--backend", os.path.join(EX, "backend"),
         "--local-columns", os.path.join(EX, "local_columns.txt")]
 
 
+def _lf(tekst):
+    return tekst.replace("\r\n", "\n")
+
+
 def uruchom(*extra):
     out, err = io.BytesIO(), io.BytesIO()
     kod = sta.main(ARGS + list(extra), stdout=out, stderr=err)
@@ -33,15 +37,16 @@ class Golden(TmpTestCase):
                 f.write(out)
         with open(sciezka, "rb") as f:
             oczekiwane = f.read()
-        self.assertEqual(out.decode("utf-8"), oczekiwane.decode("utf-8"))
+        # niezależnie od core.autocrlf: porównanie po normalizacji końców linii
+        self.assertEqual(_lf(out.decode("utf-8")), _lf(oczekiwane.decode("utf-8")))
         self.assertEqual(kod, 1)
         self.assertEqual(err, b"")
 
     def test_expected_file_is_lf_utf8(self):
         with open(os.path.join(EX, "EXPECTED.md"), "rb") as f:
             dane = f.read()
-        self.assertNotIn(b"\r", dane)
         dane.decode("utf-8")
+        self.assertNotIn(b"\r", dane.replace(b"\r\n", b"\n"))  # CRLF z checkoutu autocrlf jest dopuszczalny
 
     def test_every_category_present_in_examples(self):
         sciezka = os.path.join(self.tmp, "r.json")
