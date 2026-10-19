@@ -10,6 +10,7 @@ Wyjście zawsze UTF-8 z końcami linii LF, ścieżki zawsze ze znakiem ``/``.
 """
 import argparse
 import ast
+import csv
 import fnmatch
 import io
 import json
@@ -611,7 +612,7 @@ def _przytnij(tekst):
 
 
 _KEEP = re.compile(
-    r"""^(?:\d{4}-\d{2}-\d{2}(?:[ T][\d:.]+)?|[+-]\d{2}(?::?\d{2})?|\d+\s*(?:seconds?|minutes?|hours?|days?|weeks?|months?|years?)
+    r"""^(?:\d{4}-\d{2}-\d{2}(?:[ T][\d:.]+(?:Z|[+-]\d{2}:?\d{2})?)?|T|[a-z]{2,3}-[A-Z]{2}|[+-]\d{2}(?::?\d{2})?|\d+\s*(?:seconds?|minutes?|hours?|days?|weeks?|months?|years?)
     |(?:year|quarter|month|week|day|hour|minute|second|dow|doy|epoch|isodow|cron|interval|date|utc)
     |[A-Za-z_]+/[A-Za-z_]+
     |(?:[%A-Za-z]|[\s/_.:\-])*%(?:[%A-Za-z]|[\s/_.:\-])*
@@ -1755,11 +1756,13 @@ def czy_wykluczony(rel, wzorce):
     return False
 
 
-def zbierz_pliki(backend, wykluczenia=(), files_from=None, ostrzez=None):
+def zbierz_pliki(backend, wykluczenia=(), files_from=None, ostrzez=None, rozszerzenia=(".py",),
+                 domyslne_katalogi=DOMYSLNE_WYKLUCZENIA, wzorce_domyslne=()):
     """-> posortowana lista (rel_posix, sciezka_fizyczna)."""
     ostrzez = ostrzez or (lambda m: None)
     korzen = os.path.abspath(backend)
-    domyslne = set(x.lower() for x in DOMYSLNE_WYKLUCZENIA)
+    domyslne = set(x.lower() for x in domyslne_katalogi)
+    wykluczenia = tuple(wykluczenia) + tuple(wzorce_domyslne)
     wynik = {}
 
     def wykluczony(rel):
@@ -1775,7 +1778,7 @@ def zbierz_pliki(backend, wykluczenia=(), files_from=None, ostrzez=None):
                 d for d in podkat
                 if d.lower() not in domyslne and not czy_wykluczony((wzgl + "/" + d).lstrip("/"), wykluczenia))
             for p in sorted(pliki):
-                if not p.endswith(".py"):
+                if not p.endswith(rozszerzenia):
                     continue
                 rel = (wzgl + "/" + p).lstrip("/")
                 if not czy_wykluczony(rel, wykluczenia):
@@ -1786,7 +1789,7 @@ def zbierz_pliki(backend, wykluczenia=(), files_from=None, ostrzez=None):
             if not linia or linia.startswith("#"):
                 continue
             p = _norm_sciezka(linia)
-            if not p.endswith(".py"):
+            if not p.endswith(rozszerzenia):
                 continue
             kandydaci = [p] if os.path.isabs(p) or re.match(r"^[A-Za-z]:/", p) else [
                 os.path.join(korzen, p), p]
@@ -1970,6 +1973,1072 @@ def json_raportu(raport):
     return json.dumps(dane, ensure_ascii=False, indent=2) + "\n"
 
 
+# --------------------------------------------------------------------------- tryb TypeScript / JavaScript
+#
+# Bez parsera: leksyker (komentarze, napisy, szablony, regexy) + wyrażenia regularne na "szkielecie"
+# kodu + proste śledzenie zmiennych w obrębie zakresu funkcji. Tylko raport.
+
+ROZSZERZENIA_TS = (".ts", ".tsx", ".js", ".jsx")
+DOMYSLNE_WYKLUCZENIA_TS = ("node_modules", "dist", "build", ".next", "out", "coverage", ".git", ".turbo",
+                           ".cache", "storybook-static", "__tests__", "__mocks__", "tests", "test", "e2e",
+                           "cypress")
+WZORCE_PLIKOW_TS = ("*.test.*", "*.spec.*", "*.min.js", "*.d.ts", "*.stories.*")
+
+# kod -> (ważność domyślna, dlaczego, podpowiedź)
+KODY_TS = OrderedDict([
+    ("ts_today_iso_slice", (
+        "wysoka",
+        "toISOString() zwraca datę UTC: w nocy (do 01:00/02:00 w Polsce) \"dzisiejsza data\" to jeszcze wczoraj; "
+        "data lokalna (np. północ z datepickera) przesuwa się o dzień wstecz.",
+        "Użyj wspólnego helpera dzisWarszawa(), np. new Intl.DateTimeFormat('sv-SE', "
+        "{ timeZone: 'Europe/Warsaw' }).format(new Date()) daje YYYY-MM-DD.")),
+    ("ts_date_only_parse", (
+        "srednia",
+        "Data bez czasu ('YYYY-MM-DD') jest parsowana jako północ UTC, a nie lokalna: porównania z lokalnym "
+        "\"dziś\" i granice doby są błędne.",
+        "Parsuj lokalnie: new Date(rok, miesiac - 1, dzien), albo trzymaj datę jako string 'YYYY-MM-DD' "
+        "i porównuj ze stringiem z dzisWarszawa().")),
+    ("ts_locale_no_timezone", (
+        "srednia",
+        "toLocale*String / Intl.DateTimeFormat bez timeZone pokazują czas w strefie przeglądarki, nie firmy; "
+        "dla wartości z timestamptz (ISO z 'Z') data i godzina mogą się różnić o 1-2 godziny.",
+        "Podaj { timeZone: 'Europe/Warsaw' } albo użyj wspólnego helpera formatujDateWarszawa(wartosc).")),
+    ("ts_local_getter_on_utc", (
+        "srednia",
+        "getDate()/getMonth()/getFullYear()/getHours() zwracają części daty w strefie przeglądarki, a obiekt "
+        "pochodzi z ISO UTC (timestamptz): wynik zależy od strefy użytkownika, nie firmy.",
+        "Pobierz części daty przez formatujDateWarszawa() / Intl.DateTimeFormat z timeZone: 'Europe/Warsaw'.")),
+    ("ts_string_date_compare", (
+        "srednia",
+        "Data jako string 'YYYY-MM-DD' porównywana z obiektem Date (lub jego liczbą): porównanie typów "
+        "mieszanych daje wynik zależny od koercji i strefy.",
+        "Porównuj tę samą reprezentację: dwa stringi YYYY-MM-DD (z dzisWarszawa()) albo dwa Date (getTime()).")),
+    ("ts_now_into_local_field", (
+        "wysoka",
+        "Bieżący czas UTC (toISOString() z 'Z' / Date.now()) trafia do pola typu timestamp bez strefy, które "
+        "ma przechowywać czas lokalny (ze ściany zegara).",
+        "Wyślij czas lokalny bez 'Z' (formatujDateWarszawa()) albo niech czas ustawi serwer; nie wysyłaj UTC "
+        "do kolumny lokalnej.")),
+    ("ts_startof_day_utc", (
+        "wysoka",
+        "Początek/koniec doby liczony na dacie pochodzącej z UTC (data-only, ISO z 'Z', .utc()) wyznacza "
+        "granicę doby w UTC zamiast w Warszawie: filtry zakresu gubią lub dublują godziny przy północy.",
+        "Policz granice doby w Warszawie (poczatekDobyWarszawa(data)) i dopiero potem zamień na UTC.")),
+    ("ts_manual_hour_shift", (
+        "srednia",
+        "Ręczne dodawanie/odejmowanie 1-2 godzin psuje się przy zmianie czasu (ostatnie niedziele marca "
+        "i października).",
+        "Nie przesuwaj o stałą liczbę godzin; przelicz strefą Europe/Warsaw (Intl / date-fns-tz).")),
+])
+
+_SLOWA_PRZED_REGEXEM = frozenset(["return", "typeof", "case", "in", "of", "delete", "void", "throw", "new",
+                                  "else", "do", "yield", "await"])
+_SLOWA_KLUCZ_JS = frozenset(["if", "for", "while", "switch", "catch", "function", "return", "with", "else", "do",
+                             "try", "typeof", "new", "await", "yield", "super", "import", "export", "in", "of",
+                             "void", "delete", "throw", "case"])
+
+
+def lex_js(src):
+    """-> (code, skel, tzok). code: komentarze zamienione na spacje; skel: dodatkowo treść napisów/regexów.
+
+    tzok: lista (linia, trailing) komentarzy zawierających ``tz-ok`` (trailing = po kodzie w tej samej linii).
+    Obie wersje mają tę samą długość co ``src``.
+    """
+    n = len(src)
+    code, skel = [], []
+    tzok = []
+    stan = {"tail": "", "line": 1, "kod": False}
+    stos = []  # liczniki klamer dla ${ ... } w szablonach
+
+    def emit(c, s):
+        code.append(c)
+        skel.append(s)
+        stan["tail"] = (stan["tail"] + s)[-30:]
+        if "\n" in s:
+            stan["line"] += s.count("\n")
+            stan["kod"] = bool(s.rsplit("\n", 1)[1].strip())
+        elif s.strip():
+            stan["kod"] = True
+
+    def puste(t):
+        return "".join("\n" if ch == "\n" else " " for ch in t)
+
+    def szablon(i):
+        """Skanuje tekst szablonu od i; zwraca nowe i."""
+        j = i
+        while j < n:
+            ch = src[j]
+            if ch == "\\":
+                j += 2
+                continue
+            if ch == "`" or (ch == "$" and src[j + 1:j + 2] == "{"):
+                break
+            j += 1
+        j = min(j, n)
+        emit(src[i:j], puste(src[i:j]))
+        if j < n and src[j] == "`":
+            emit("`", "`")
+            return j + 1
+        if j < n:
+            emit("${", "${")
+            stos.append(0)
+            return j + 2
+        return j
+
+    i = 0
+    while i < n:
+        c = src[i]
+        d = src[i + 1:i + 2]
+        if c == "/" and d == "/":
+            j = src.find("\n", i)
+            j = n if j == -1 else j
+            if "tz-ok" in src[i:j]:
+                tzok.append((stan["line"], stan["kod"]))
+            emit(" " * (j - i), " " * (j - i))
+            i = j
+        elif c == "/" and d == "*":
+            j = src.find("*/", i + 2)
+            j = n if j == -1 else j + 2
+            if "tz-ok" in src[i:j]:
+                tzok.append((stan["line"], stan["kod"]))
+            emit(puste(src[i:j]), puste(src[i:j]))
+            i = j
+        elif c in "'\"":
+            j = i + 1
+            while j < n and src[j] != c and src[j] != "\n":
+                j += 2 if src[j] == "\\" else 1
+            j = min(j, n)
+            if j < n and src[j] == c:
+                seg = src[i:j + 1]
+                emit(seg, c + puste(seg[1:-1]) + c)
+            else:  # niedomknięty (np. apostrof w tekście JSX) - tylko do końca linii
+                seg = src[i:j]
+                emit(seg, c + puste(seg[1:]))
+            i += len(seg)
+        elif c == "`":
+            emit("`", "`")
+            i = szablon(i + 1)
+        elif c == "}" and stos and stos[-1] == 0:
+            stos.pop()
+            emit("}", "}")
+            i = szablon(i + 1)
+        elif c == "/":
+            tail = stan["tail"].rstrip()
+            slowo = re.search(r"([A-Za-z_$][\w$]*)$", tail)
+            czy_regex = (not tail) or tail[-1] in "(,=:[!&|?{};+-*%~^" or bool(slowo and slowo.group(1) in _SLOWA_PRZED_REGEXEM)
+            j = i + 1
+            if czy_regex:
+                w_klasie = False
+                while j < n:
+                    ch = src[j]
+                    if ch == "\\":
+                        j += 2
+                        continue
+                    if ch == "\n":
+                        break
+                    if ch == "[":
+                        w_klasie = True
+                    elif ch == "]":
+                        w_klasie = False
+                    elif ch == "/" and not w_klasie:
+                        break
+                    j += 1
+            if czy_regex and j < n and src[j] == "/":
+                seg = src[i:j + 1]
+                emit(seg, "/" + " " * (len(seg) - 2) + "/")
+                i = j + 1
+            else:
+                emit(c, c)
+                i += 1
+        else:
+            if stos:
+                if c == "{":
+                    stos[-1] += 1
+                elif c == "}":
+                    stos[-1] -= 1
+            emit(c, c)
+            i += 1
+    return "".join(code), "".join(skel), tzok
+
+
+def _para_wstecz(s, i):
+    """Indeks otwierającego nawiasu dla zamykającego s[i] (``)``, ``]``, ``}``) albo -1."""
+    zam = s[i]
+    otw = {")": "(", "]": "[", "}": "{"}[zam]
+    depth = 0
+    for j in range(i, -1, -1):
+        if s[j] == zam:
+            depth += 1
+        elif s[j] == otw:
+            depth -= 1
+            if depth == 0:
+                return j
+    return -1
+
+
+def _para_wprzod(s, i):
+    otw = s[i]
+    zam = {"(": ")", "[": "]", "{": "}"}[otw]
+    depth = 0
+    for j in range(i, len(s)):
+        if s[j] == otw:
+            depth += 1
+        elif s[j] == zam:
+            depth -= 1
+            if depth == 0:
+                return j
+    return -1
+
+
+def _podziel_arg(s):
+    """Dzieli tekst argumentów po przecinkach na poziomie 0."""
+    czesci, depth, start = [], 0, 0
+    for j, ch in enumerate(s):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            czesci.append(s[start:j])
+            start = j + 1
+    czesci.append(s[start:])
+    return czesci
+
+
+def odbiorca_przed(skel, kropka):
+    """Początek wyrażenia-odbiorcy kończącego się tuż przed ``kropka`` (indeks '.' lub '?')."""
+    start = kropka
+    while True:
+        while start > 0 and skel[start - 1].isspace():
+            start -= 1
+        if start == 0:
+            break
+        ch = skel[start - 1]
+        if ch in ")]":
+            o = _para_wstecz(skel, start - 1)
+            if o < 0:
+                break
+            start = o
+            if ch == ")":
+                lo = max(0, start - 120)  # okno: nazwy są krótkie, a search po całym prefiksie byłby kwadratowy
+                m = re.search(r"((?:new\s+)?[A-Za-z_$][\w$]*)\s*$", skel[lo:start])
+                if m and m.group(1) not in _SLOWA_KLUCZ_JS:
+                    start = lo + m.start(1)
+        elif ch.isalnum() or ch in "_$":
+            lo = max(0, start - 120)
+            m = re.search(r"[A-Za-z_$][\w$]*$", skel[lo:start])
+            if not m:
+                break
+            start = lo + m.start()
+        elif ch in "'\"`":
+            o = skel.rfind(ch, 0, start - 1)
+            if o < 0:
+                break
+            start = o
+        else:
+            break
+        p = start
+        while p > 0 and skel[p - 1].isspace():
+            p -= 1
+        if p > 0 and skel[p - 1] == ".":
+            q = p - 1
+            if q > 0 and skel[q - 1] == "?":
+                q -= 1
+            start = q
+            continue
+        break
+    return start
+
+
+def odbiorca_po(skel, poz):
+    """Koniec wyrażenia (łańcuch wywołań/własności/literał) zaczynającego się od ``poz``; None gdy brak."""
+    n = len(skel)
+    j = poz
+    while j < n and skel[j].isspace():
+        j += 1
+    start = j
+    m = re.compile(r"new\s+").match(skel, j)
+    if m:
+        j = m.end()
+    while j < n:
+        ch = skel[j]
+        if ch in "'\"`":
+            k = skel.find(ch, j + 1)
+            if k < 0:
+                return None
+            j = k + 1
+        elif ch in "([":
+            k = _para_wprzod(skel, j)
+            if k < 0:
+                return None
+            j = k + 1
+        elif ch.isalnum() or ch in "_$":
+            m = re.compile(r"[\w$]+").match(skel, j)
+            j = m.end()
+        elif ch in ".?" and re.compile(r"\??\.\s*[\w$]").match(skel, j):
+            j += 1
+        else:
+            break
+    return (start, j) if j > start else None
+
+
+_RE_ZAKRES_RHS = re.compile(
+    r"\s*(?:(?:React\.)?(?:memo|forwardRef|useCallback)\s*(?:<[^>()]*>)?\(\s*)?(?:async\s+)?")
+_RE_STRZALKA = re.compile(r"\s*(?::[^=;{]*?)?\s*=>")
+
+
+def znajdz_zakresy(skel):
+    """-> lista (start, koniec, nazwa) zakresów nazwanych funkcji, komponentów, klas i metod."""
+    zakresy = []
+    n = len(skel)
+
+    def klamra(i):
+        b = skel.find("{", i)
+        if b < 0:
+            return None
+        e = _para_wprzod(skel, b)
+        return (b, e if e >= 0 else n)
+
+    for m in re.finditer(r"\bfunction\s*\*?\s*([A-Za-z_$][\w$]*)\s*(?:<[^>(]*>)?\s*\(", skel):
+        c = _para_wprzod(skel, m.end() - 1)
+        if c >= 0:
+            k = klamra(c)
+            if k:
+                zakresy.append((m.start(), k[1], m.group(1)))
+    for m in re.finditer(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=\n]+)?=(?![=>])", skel):
+        p = _RE_ZAKRES_RHS.match(skel, m.end()).end()
+        if skel.startswith("function", p):
+            o = skel.find("(", p)
+            c = _para_wprzod(skel, o) if o >= 0 else -1
+            k = klamra(c) if c >= 0 else None
+            if k:
+                zakresy.append((m.start(), k[1], m.group(1)))
+            continue
+        koniec_arg = None
+        if p < n and skel[p] == "(":
+            c = _para_wprzod(skel, p)
+            sa = _RE_STRZALKA.match(skel, c + 1) if c >= 0 else None
+            koniec_arg = sa.end() if sa else None
+        else:
+            sa = re.compile(r"[A-Za-z_$][\w$]*\s*=>").match(skel, p)
+            koniec_arg = sa.end() if sa else None
+        if koniec_arg is None:
+            continue
+        q = koniec_arg
+        while q < n and skel[q].isspace():
+            q += 1
+        if q < n and skel[q] == "{":
+            e = _para_wprzod(skel, q)
+            zakresy.append((m.start(), e if e >= 0 else n, m.group(1)))
+        else:
+            kon = re.compile(r"\n(?=[A-Za-z@])").search(skel, q)
+            zakresy.append((m.start(), kon.start() if kon else n, m.group(1)))
+    for m in re.finditer(r"\bclass\s+([A-Za-z_$][\w$]*)[^{;]*\{", skel):
+        e = _para_wprzod(skel, m.end() - 1)
+        e = n if e < 0 else e
+        zakresy.append((m.start(), e, m.group(1)))
+        for mm in re.finditer(r"(?m)^[ \t]*(?:(?:public|private|protected|static|readonly|async|override)\s+)*"
+                              r"(?:get\s+|set\s+)?([A-Za-z_$][\w$]*)\s*(?:<[^>()]*>)?\(", skel[m.end():e]):
+            if mm.group(1) in _SLOWA_KLUCZ_JS:
+                continue
+            o = m.end() + mm.end() - 1
+            c = _para_wprzod(skel, o)
+            if c < 0 or not re.compile(r"\s*(?::[^{;=]+)?\{").match(skel, c + 1):
+                continue
+            k = klamra(c)
+            if k:
+                zakresy.append((m.end() + mm.start(), k[1], m.group(1) + "." + mm.group(1)))
+    return zakresy
+
+
+_NAZWA_TS_RE = re.compile(r"[a-z0-9]At$|_at$|[Tt]imestamp|^iso|Iso|_iso|ISO|[Uu]tc|UTC")
+_NAZWA_DATA_RE = re.compile(r"(?:^|[a-z0-9_])[dD]ate$|^date$|_date$|[dD]ay$")
+_LOKALNE_PREFIKSY = ("start", "end", "planned", "scheduled", "due")
+
+
+def _norm_pole(nazwa):
+    return nazwa.replace("_", "").lower()
+
+
+def pola_z_wpisow(wpisy):
+    """Wpisy z plików kolumn (``tabela.kolumna`` / ``kolumna``) -> zbiór znormalizowanych nazw pól (camel = snake)."""
+    return frozenset(_norm_pole(w.split(".")[-1]) for w in wpisy if w.strip())
+
+
+class AnalizatorTs:
+    """Analiza jednego pliku .ts/.tsx/.js/.jsx."""
+
+    def __init__(self, tekst, plik, lokalne=frozenset(), systemowe=frozenset()):
+        self.plik = plik
+        self.tekst = tekst.replace("\r\n", "\n").replace("\r", "\n").lstrip("﻿")
+        self.lokalne = frozenset(lokalne)
+        self.systemowe = frozenset(systemowe)
+        self.code, self.skel, tzok = lex_js(self.tekst)
+        self.pocz_linii = [0] + [m.end() for m in re.finditer(r"\n", self.tekst)]
+        self.tlumione = set()
+        for linia, trailing in tzok:
+            self.tlumione.add(linia)
+            if not trailing:
+                self.tlumione.add(linia + 1)
+        self.zakresy = znajdz_zakresy(self.skel)
+        self.przypisania = {}
+        self.wyniki = []
+        self._widziane = set()
+        self._zbierz_przypisania()
+
+    # ----- pozycje, kontekst
+    def linia(self, poz):
+        lo, hi = 0, len(self.pocz_linii) - 1
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if self.pocz_linii[mid] <= poz:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo + 1
+
+    def zakres_poz(self, poz):
+        w = [z for z in self.zakresy if z[0] <= poz <= z[1]]
+        return min(w, key=lambda z: z[1] - z[0]) if w else (0, len(self.skel), None)
+
+    def kontekst(self, poz):
+        lancuch = sorted((z for z in self.zakresy if z[0] <= poz <= z[1]), key=lambda z: -(z[1] - z[0]))
+        if not lancuch:
+            return "moduł"
+        ext = os.path.splitext(self.plik)[1].lower()
+        sciezka_api = bool(re.search(r"(?i)(^|/)(api|client|clients|services?|http|requests?|fetchers?)(/|\.|$)|"
+                                     r"(api|client|service)[A-Za-z]*\.[jt]sx?$", self.plik))
+
+        def rodzaj(z):
+            baza = z[2].split(".")[-1]
+            if re.match(r"use[A-Z0-9]", baza):
+                return "hook"
+            if baza[:1].isupper() and (ext in (".tsx", ".jsx") or re.search(r"<[A-Za-z][\w.]*[\s/>]", self.skel[z[0]:z[1]])) \
+                    and "." not in z[2]:
+                return "komponent"
+            if sciezka_api:
+                return "klient API"
+            return "metoda" if "." in z[2] else "funkcja"
+
+        glowny = next((z for z in lancuch if rodzaj(z) in ("hook", "komponent", "klient API")), None)
+        wewn = lancuch[-1]
+        if glowny is None:
+            return "%s %s" % (rodzaj(wewn), wewn[2])
+        opis = "%s %s" % (rodzaj(glowny), glowny[2])
+        if wewn is not glowny:
+            opis += " › " + wewn[2]
+        return opis
+
+    # ----- klasyfikacja wyrażeń: (typ, pochodzenie, pewne)
+    def klasa_nazwy(self, nazwa):
+        n = _norm_pole(nazwa)
+        if n in self.lokalne:
+            return ("val", "local_field", True)
+        if n in self.systemowe:
+            return ("val", "ts", True)
+        if n.startswith(_LOKALNE_PREFIKSY):
+            return ("val", "local_field", False)
+        if _NAZWA_TS_RE.search(nazwa):
+            return ("val", "ts", False)
+        if _NAZWA_DATA_RE.search(nazwa):
+            return ("val", "date_name", False)
+        return None
+
+    def zmienna(self, nazwa, poz):
+        najlepsze = None
+        for ppoz, kl, (zs, ze) in self.przypisania.get(nazwa, ()):
+            if ppoz < poz and zs <= poz <= ze and (najlepsze is None or ppoz > najlepsze[0]):
+                najlepsze = (ppoz, kl)
+        return najlepsze[1] if najlepsze else None
+
+    def _nowa_data(self, args, poz, glebia):
+        a = args.strip()
+        if a == "" or re.fullmatch(r"Date\.now\(\s*\)", a):
+            return ("date", "now", False)
+        czesci = _podziel_arg(a)
+        if len(czesci) >= 2:
+            return ("date", "local", True)
+        m = re.fullmatch(r"""(['"`])(.*)\1""", a, re.S)
+        if m:
+            v = m.group(2)
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", v):
+                return ("date", "date_only", True)
+            if re.match(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}", v):
+                if re.search(r"(Z|[+-]\d{2}:?\d{2})$", v):
+                    return ("date", "z", True)
+                return ("date", "local", True)
+            if m.group(1) == "`" and re.fullmatch(r"\$\{[^}]*\}-\$\{[^}]*\}-\$\{[^}]*\}", v):
+                return ("date", "date_only", False)
+            return ("date", "unknown", False)
+        k = self.klasa(a, poz, glebia + 1)
+        if k is None:
+            return ("date", "unknown", False)
+        typ, org, pewne = k
+        if typ == "str" and org in ("iso_now", "iso_local", "iso_z"):
+            return ("date", "z", True)  # łańcuch z toISOString() ma 'Z', niezależnie od tego, z czego powstał
+        if typ == "str" and org == "iso_unk":
+            return ("date", "ts", False)
+        if typ == "str" and org.startswith("dateonly"):
+            return ("date", "date_only", pewne)
+        if typ == "str" and org == "date_only":
+            return ("date", "date_only", pewne)
+        if typ == "date":
+            return k
+        if typ == "num" and org == "now":
+            return ("date", "now", pewne)
+        if typ == "val" and org in ("ts", "date_name", "local_field"):
+            return ("date", org, pewne)
+        return ("date", "unknown", False)
+
+    def _metoda(self, cur, m, args):
+        typ, org, pewne = cur
+        if m in ("toISOString", "toJSON"):
+            if typ in ("date", "val"):
+                if typ == "date" and org == "now":
+                    return ("str", "iso_now", pewne)
+                if typ == "date" and org == "local":
+                    return ("str", "iso_local", pewne)
+                if typ == "date" and org in ("z", "date_only"):
+                    return ("str", "iso_z", pewne)
+                return ("str", "iso_unk", False)
+            return None
+        if m in ("slice", "substring", "substr") and re.fullmatch(r"\s*0\s*,\s*10\s*", args):
+            if typ == "str" and org.startswith("iso_"):
+                return ("str", "dateonly_" + org[4:], pewne)
+            return ("str", "date_only", False)
+        if m == "split" and args.strip() in ("'T'", '"T"'):
+            return ("splitT", org, pewne)
+        if m in ("getTime", "valueOf"):
+            return ("num", org, pewne)
+        if m.startswith("toLocale"):
+            return ("str", "display", False)
+        return None
+
+    def klasa(self, wyr, poz, glebia=0):
+        s = re.sub(r"\s+as\s+[\w$.<>\[\]| ]+$", "", wyr.strip()).rstrip("!").strip()
+        if not s or glebia > 8:
+            return None
+        if s[0] == "(" and _para_wprzod(s, 0) == len(s) - 1:
+            return self.klasa(s[1:-1], poz, glebia + 1)
+        m = re.match(r"new\s+Date\s*\(", s)
+        if m:
+            c = _para_wprzod(s, m.end() - 1)
+            if c < 0:
+                return None
+            cur, idx = self._nowa_data(s[m.end():c], poz, glebia), c + 1
+        elif re.match(r"Date\.now\s*\(\s*\)", s):
+            cur, idx = ("num", "now", False), re.match(r"Date\.now\s*\(\s*\)", s).end()
+        elif s[0] in "'\"`":
+            mm = re.match(r"""(['"`])(.*?)(?<!\\)\1""", s, re.S)
+            if not mm:
+                return None
+            v = mm.group(2)
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", v):
+                cur = ("str", "date_only", True)
+            elif re.match(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}.*(Z|[+-]\d{2}:?\d{2})$", v):
+                cur = ("str", "iso_z", True)
+            else:
+                cur = ("str", "other", False)
+            idx = mm.end()
+        else:
+            mm = re.match(r"[A-Za-z_$][\w$]*", s)
+            if not mm:
+                return None
+            nazwa, idx = mm.group(0), mm.end()
+            cur = self.zmienna(nazwa, poz) or self.klasa_nazwy(nazwa) or ("val", "unknown", False)
+        n = len(s)
+        while idx < n:
+            while idx < n and s[idx].isspace():
+                idx += 1
+            if idx >= n:
+                break
+            if s[idx] == "!":
+                idx += 1
+                continue
+            if s.startswith("?.", idx):
+                idx += 1
+            if idx < n and s[idx] == "[":
+                c = _para_wprzod(s, idx)
+                if c < 0:
+                    return None
+                if cur[0] == "splitT" and s[idx + 1:c].strip() == "0":
+                    cur = ("str", "dateonly_" + cur[1][4:] if cur[1].startswith("iso_") else "date_only", cur[2])
+                else:
+                    cur = ("val", "unknown", False)
+                idx = c + 1
+                continue
+            mm = re.compile(r"\.\s*([A-Za-z_$][\w$]*)").match(s, idx)
+            if not mm:
+                return None
+            idx = mm.end()
+            if idx < n and s[idx] == "(":
+                c = _para_wprzod(s, idx)
+                if c < 0:
+                    return None
+                cur = self._metoda(cur, mm.group(1), s[idx + 1:c]) or ("val", "unknown", False)
+                idx = c + 1
+            else:
+                cur = self.klasa_nazwy(mm.group(1)) or ("val", "unknown", False)
+        return cur
+
+    # ----- przypisania zmiennych
+    def _zbierz_przypisania(self):
+        for m in re.finditer(r"(?<![\w$.])(?:(?:const|let|var)\s+)?([A-Za-z_$][\w$]*)\s*"
+                             r"(?::\s*[A-Za-z_$][\w$<>\[\]|. ]*)?=(?![=>])", self.skel):
+            if m.group(1) in _SLOWA_KLUCZ_JS:
+                continue
+            start = m.end()
+            koniec = _koniec_wyr(self.skel, start)
+            kl = self.klasa(self.code[start:koniec], start)
+            if kl is None or kl[1] in ("unknown",):
+                continue
+            z = self.zakres_poz(m.start())
+            self.przypisania.setdefault(m.group(1), []).append((m.start(), kl, (z[0], z[1])))
+
+    # ----- raportowanie
+    def fragment(self, poz):
+        linia = self.linia(poz)
+        tekst = self.code[self.pocz_linii[linia - 1]:(self.pocz_linii[linia] - 1 if linia < len(self.pocz_linii)
+                                                       else len(self.code))]
+        kol = poz - self.pocz_linii[linia - 1]
+        if len(tekst) > MAKS_FRAGMENT:
+            lo = max(0, kol - 50)
+            tekst = tekst[lo:lo + MAKS_FRAGMENT]
+        return _przytnij(_ws(_maskuj_literaly(tekst, sql_single=False)))
+
+    def dodaj(self, kod, poz, waznosc=None, pewnosc="uncertain", dlaczego_extra=""):
+        linia = self.linia(poz)
+        if linia in self.tlumione:
+            return
+        waz, dlaczego, podp = KODY_TS[kod]
+        kont = self.kontekst(poz)
+        fr = self.fragment(poz)
+        k = (linia, kod, normalizuj(fr))
+        if k in self._widziane:
+            return
+        self._widziane.add(k)
+        self.wyniki.append(Wynik(self.plik, kont, linia, "", kod, waznosc or waz, pewnosc, fr,
+                                 (dlaczego + " " + dlaczego_extra).strip(), podp))
+
+    # ----- wzorce
+    def uruchom(self):
+        for f in (self.p1_today_iso_slice, self.p2_date_only_parse, self.p3_locale, self.p4_getters,
+                  self.p5_string_compare, self.p6_now_into_local, self.p7_start_of_day, self.p8_hour_shift):
+            try:
+                f()
+            except Exception:  # nigdy nie wywalaj się na dziwnym kodzie
+                continue
+        self.wyniki.sort(key=lambda w: (w.linia, w.kategoria))
+        return self.wyniki
+
+    def _w_kodzie(self, poz):
+        return poz < len(self.skel) and self.skel[poz] in ".?"
+
+    def p1_today_iso_slice(self):
+        rx = re.compile(r"\??\.\s*(?:slice|substring|substr)\s*\(\s*0\s*,\s*10\s*\)|"
+                        r"\??\.\s*split\s*\(\s*['\"]T['\"]\s*\)\s*(?:\[\s*0\s*\]|\.\s*(?:shift|at)\s*\(\s*0?\s*\))")
+        for m in rx.finditer(self.code):
+            if not self._w_kodzie(m.start()):
+                continue
+            rs = odbiorca_przed(self.skel, m.start())
+            recv = self.code[rs:m.start()]
+            if "toISOString" not in recv and "toJSON" not in recv:
+                k = self.klasa(recv, rs)
+                if not (k and k[0] == "str" and k[1].startswith("iso_")):
+                    continue
+            k = self.klasa(recv, rs)
+            if k is None:
+                continue
+            if k[0] == "str" and k[1] in ("iso_now", "iso_local"):
+                self.dodaj("ts_today_iso_slice", rs, "wysoka", "likely")
+            elif k[0] == "str" and k[1] in ("iso_z", "iso_unk"):
+                if re.search(r"new\s+Date\s*\(\s*['\"`]\d{4}-\d{2}-\d{2}['\"`]\s*\)\s*\.\s*toISOString", recv):
+                    continue  # data-only literal parsowana jako UTC: wynik to ta sama data
+                self.dodaj("ts_today_iso_slice", rs, "srednia", "uncertain",
+                           "Odbiorca nie jest bieżącym czasem, ale to nadal data UTC, nie data w Warszawie.")
+
+    def p2_date_only_parse(self):
+        rx = re.compile(r"""\bnew\s+Date\s*\(\s*(['"`])(\d{4}-\d{2}-\d{2})\1\s*\)|"""
+                        r"""\bDate\s*\.\s*parse\s*\(\s*(['"`])(\d{4}-\d{2}-\d{2})\3\s*\)""")
+        for m in rx.finditer(self.code):
+            if self.skel[m.start()] != "n" and self.skel[m.start()] != "D":
+                continue
+            self._zglos_date_only(m.start(), m.end(), "likely")
+        rx2 = re.compile(r"\bnew\s+Date\s*\(")
+        for m in rx2.finditer(self.skel):
+            c = _para_wprzod(self.skel, m.end() - 1)
+            if c < 0:
+                continue
+            arg = self.code[m.end():c].strip()
+            if re.fullmatch(r"""['"`]\d{4}-\d{2}-\d{2}['"`]""", arg) or not arg or "," in arg:
+                continue
+            if re.fullmatch(r"`\$\{[^}]*\}-\$\{[^}]*\}-\$\{[^}]*\}`", arg):
+                self._zglos_date_only(m.start(), c + 1, "uncertain")
+                continue
+            if re.fullmatch(r"[A-Za-z_$][\w$]*", arg):
+                k = self.zmienna(arg, m.start())
+                if k and k[0] == "str" and (k[1] == "date_only" or k[1].startswith("dateonly")):
+                    self._zglos_date_only(m.start(), c + 1, "uncertain")
+            elif re.search(r"\.\s*(?:slice|substring|substr)\s*\(\s*0\s*,\s*10\s*\)\s*$|\.split\(\s*['\"]T['\"]\s*\)\[0\]$", arg):
+                self._zglos_date_only(m.start(), c + 1, "uncertain")
+
+    def _zglos_date_only(self, s, e, pewnosc):
+        po = self.skel[e:e + 60]
+        tylko_wyswietlanie = bool(re.match(r"\s*\.\s*(?:toLocale(?:Date)?String|toISOString)\s*\(", po)) \
+            and not re.search(r"[<>]=?|===?|getTime|setHours", self.skel[max(0, s - 25):e + 40])
+        self.dodaj("ts_date_only_parse", s, "niska" if tylko_wyswietlanie else None, pewnosc,
+                   "Użyte tylko do wyświetlenia (w Polsce data wyświetli się poprawnie)." if tylko_wyswietlanie else "")
+
+    def _opcje_czasu(self, metoda, args):
+        data_only = bool(re.search(r"year|month|day|weekday|dateStyle", args)) and \
+            not re.search(r"hour|minute|second|timeStyle|timeZoneName", args)
+        if metoda == "toLocaleTimeString":
+            return True
+        if metoda == "toLocaleDateString":
+            return bool(re.search(r"hour|minute|second|timeStyle", args))
+        return not data_only
+
+    def p3_locale(self):
+        rx = re.compile(r"\??\.\s*(toLocaleDateString|toLocaleTimeString|toLocaleString)\s*\(")
+        for m in rx.finditer(self.skel):
+            o = m.end() - 1
+            c = _para_wprzod(self.skel, o)
+            if c < 0:
+                continue
+            args = self.code[o + 1:c]
+            rs = odbiorca_przed(self.skel, m.start())
+            k = self.klasa(self.code[rs:m.start()], rs)
+            metoda = m.group(1)
+            if metoda == "toLocaleString" and not (k and (k[0] == "date" or (k[0] in ("val", "str") and
+                                                                              k[1] in ("ts", "date_name", "local_field", "iso_z", "iso_now")))):
+                continue  # liczby i tablice też mają toLocaleString
+            self._locale(rs, args, k, self._opcje_czasu(metoda, args), metoda)
+        for m in re.finditer(r"\bIntl\s*\.\s*DateTimeFormat\s*\(", self.skel):
+            o = m.end() - 1
+            c = _para_wprzod(self.skel, o)
+            if c < 0:
+                continue
+            args = self.code[o + 1:c]
+            fm = re.compile(r"\s*\)?\s*\.\s*format\s*\(").match(self.skel, c + 1)
+            k = None
+            if fm:
+                fo = fm.end() - 1
+                fc = _para_wprzod(self.skel, fo)
+                if fc >= 0:
+                    k = self.klasa(self.code[fo + 1:fc], fo)
+            self._locale(m.start(), args, k, bool(re.search(r"hour|minute|second|timeStyle", args)), "Intl.DateTimeFormat")
+
+    def _locale(self, poz, args, k, ma_czas, metoda):
+        tz = re.search(r"timeZone\s*:\s*(['\"`])([^'\"`]+)\1", args)
+        origin, pewne = (k[1], k[2]) if k else ("unknown", False)
+        if origin in ("local", "date_only"):  # lokalny czas bez 'Z' / data-only (to zgłasza ts_date_only_parse)
+            return
+        if origin == "local_field" and "timeZone" not in args:
+            self.dodaj("ts_locale_no_timezone", poz, "niska", "uncertain",
+                       "Pole lokalne (timestamp bez strefy / data) - niskie ryzyko.")
+            return
+        if "timeZone" in args:
+            if tz and tz.group(2) in ("UTC", "Etc/UTC", "GMT") and origin in ("z", "ts", "iso_z", "iso_now"):
+                self.dodaj("ts_locale_no_timezone", poz, "srednia", "likely" if pewne or origin == "z" else "uncertain",
+                           "Wartość z timestamptz jest tu pokazana w UTC, nie w Warszawie.")
+            return
+        if origin in ("z", "iso_z", "iso_now"):
+            self.dodaj("ts_locale_no_timezone", poz, "wysoka", "likely")
+        elif origin == "ts":
+            self.dodaj("ts_locale_no_timezone", poz, "srednia", "likely" if pewne else "uncertain")
+        elif origin == "date_name" or not ma_czas:
+            self.dodaj("ts_locale_no_timezone", poz, "niska", "uncertain",
+                       "Wygląda na pole typu date (bez czasu) - niskie ryzyko.")
+        else:
+            self.dodaj("ts_locale_no_timezone", poz, "srednia", "uncertain")
+
+    def p4_getters(self):
+        rx = re.compile(r"\??\.\s*(getDate|getMonth|getFullYear|getHours|getMinutes|getSeconds|getDay)\s*\(\s*\)")
+        for m in rx.finditer(self.skel):
+            rs = odbiorca_przed(self.skel, m.start())
+            k = self.klasa(self.code[rs:m.start()], rs)
+            if not k or k[0] != "date" or k[1] not in ("z", "ts"):
+                continue
+            self.dodaj("ts_local_getter_on_utc", rs, None, "likely" if (k[2] or k[1] == "z") else "uncertain")
+
+    def p5_string_compare(self):
+        for m in re.finditer(r"(?<![=!<>])(===|!==|==|!=|<=|>=|<|>)(?![=>])", self.skel):
+            ls = odbiorca_przed(self.skel, m.start())
+            r = odbiorca_po(self.skel, m.end())
+            if ls == m.start() or r is None:
+                continue
+            kl = self.klasa(self.code[ls:m.start()], ls)
+            kr = self.klasa(self.code[r[0]:r[1]], r[0])
+            if not kl or not kr:
+                continue
+
+            def jest_str(k):
+                return k[0] == "str" and (k[1] == "date_only" or k[1].startswith("dateonly"))
+
+            def jest_data(k):
+                return k[0] in ("date", "num")
+
+            if (jest_str(kl) and jest_data(kr)) or (jest_str(kr) and jest_data(kl)):
+                lit = self.code[ls:m.start()].lstrip()[:1] in "'\"`" or self.code[r[0]:r[0] + 1] in "'\"`"
+                self.dodaj("ts_string_date_compare", ls, None, "likely" if lit else "uncertain")
+
+    def _lokalne_pole(self, klucz):
+        n = _norm_pole(klucz)
+        if n in self.systemowe:
+            return None
+        if n in self.lokalne:
+            return True
+        if n.startswith(_LOKALNE_PREFIKSY):
+            return False
+        return None
+
+    def _teraz_utc(self, wyr, poz):
+        w = wyr.strip()
+        if re.search(r"timeZone|\.tz\(|Warsaw|Intl\.", w):
+            return False
+        k = self.klasa(w, poz)
+        if not k:
+            return False
+        return (k[0] == "date" and k[1] == "now") or (k[0] == "num" and k[1] == "now") or \
+            (k[0] == "str" and k[1] == "iso_now")
+
+    def p6_now_into_local(self):
+        kand = []
+        for m in re.finditer(r"""(?<![\w$.])([A-Za-z_$][\w$]*|'[\w$-]+'|"[\w$-]+")\s*:\s*""", self.code):
+            if self.skel[m.start()] == self.code[m.start()]:
+                kand.append((m.group(1).strip("'\""), m.end(), m.start()))
+        for m in re.finditer(r"""\.\s*([A-Za-z_$][\w$]*)\s*=(?![=>])\s*""", self.skel):
+            kand.append((m.group(1), m.end(), m.start()))
+        for m in re.finditer(r"""\(\s*(['"])([A-Za-z_$][\w$]*)\1\s*,\s*""", self.code):
+            if self.skel[m.start()] == "(":
+                kand.append((m.group(2), m.end(), m.start()))
+        for klucz, start, poz in kand:
+            pewne = self._lokalne_pole(klucz)
+            if pewne is None:
+                continue
+            koniec = _koniec_wyr(self.skel, start)
+            if koniec <= start:
+                continue
+            wyr = self.code[start:koniec]
+            if self._teraz_utc(wyr, start):
+                self.dodaj("ts_now_into_local_field", poz, None, "likely" if pewne else "uncertain")
+
+    def p7_start_of_day(self):
+        rx = re.compile(r"\??\.\s*(setHours|setUTCHours)\s*\(\s*(?:0\s*,\s*0\s*,\s*0\s*,\s*0|23\s*,\s*59\s*,\s*59\s*,\s*999)\s*\)|"
+                        r"""\??\.\s*(startOf|endOf)\s*\(\s*(['"])(?:day|date|d)\3\s*\)""")
+        for m in rx.finditer(self.code):
+            if not self._w_kodzie(m.start()):
+                continue
+            rs = odbiorca_przed(self.skel, m.start())
+            recv = self.code[rs:m.start()]
+            if m.group(1) == "setUTCHours":
+                self.dodaj("ts_startof_day_utc", rs, None, "likely",
+                           "setUTCHours wyznacza granicę doby w UTC.")
+                continue
+            if m.group(2):  # dayjs / moment
+                if re.search(r"\.tz\s*\(|\btz\s*\(", recv):
+                    continue
+                if re.search(r"(?:dayjs|moment)\s*\.\s*utc\s*\(|\.utc\s*\(", recv):
+                    self.dodaj("ts_startof_day_utc", rs, None, "likely", "Obiekt jest w trybie UTC (.utc()).")
+                    continue
+                am = re.match(r"\s*(?:dayjs|moment)\s*\(([^()]*)\)\s*$", recv)
+                if am:
+                    arg = am.group(1).strip()
+                    k = self.klasa(arg, rs) if arg else None
+                    if re.fullmatch(r"""['"`]\d{4}-\d{2}-\d{2}T[^'"`]*(Z|[+-]\d{2}:?\d{2})['"`]""", arg):
+                        self.dodaj("ts_startof_day_utc", rs, None, "likely")
+                    elif k and k[0] in ("str", "val", "date") and (k[1] in ("iso_z", "iso_now", "z", "ts")):
+                        self.dodaj("ts_startof_day_utc", rs, None, "likely" if k[2] else "uncertain")
+                else:
+                    k = self.klasa(recv, rs)
+                    if k and k[1] in ("z", "date_only"):
+                        self.dodaj("ts_startof_day_utc", rs, None, "uncertain")
+                continue
+            k = self.klasa(recv, rs)
+            if k and k[0] == "date" and k[1] in ("z", "date_only", "ts"):
+                self.dodaj("ts_startof_day_utc", rs, None, "likely" if (k[2] or k[1] != "ts") else "uncertain")
+
+    def p8_hour_shift(self):
+        wzorce = [
+            re.compile(r"[+-]\s*[12]\s*\*\s*(?:60\s*\*\s*60|3600)\s*\*\s*1000\b"),
+            re.compile(r"[+-]\s*[12]\s*\*\s*3_?600_?000\b"),
+            re.compile(r"[+-]\s*(?:3_?600_?000|7_?200_?000)\b"),
+            re.compile(r"[+-]\s*(?:3600|7200)\s*\*\s*1000\b"),
+            re.compile(r"[+-]\s*(?:60\s*\*\s*60\s*\*\s*1000|1000\s*\*\s*60\s*\*\s*60(?:\s*\*\s*[12])?)\b"),
+            re.compile(r"\.\s*set(?:UTC)?Hours\s*\(\s*[\w$.]+\.\s*get(?:UTC)?Hours\s*\(\s*\)\s*[+-]\s*[12]\s*\)"),
+        ]
+        wyklucz = re.compile(r"(?i)expir|ttl|timeout|delay|cache|debounce|interval|retry|maxAge|snooze|stale")
+        for rx in wzorce:
+            for m in rx.finditer(self.code):
+                if self.skel[m.start()] != self.code[m.start()]:
+                    continue
+                linia = self.linia(m.start())
+                tekst_linii = self.code[self.pocz_linii[linia - 1]:(self.pocz_linii[linia] - 1 if linia < len(self.pocz_linii)
+                                                                    else len(self.code))]
+                if wyklucz.search(tekst_linii):
+                    continue
+                kontekst_tz = bool(re.search(r"(?i)offset|warsaw|utc|local|tz|zone", tekst_linii))
+                self.dodaj("ts_manual_hour_shift", m.start(), None, "likely" if kontekst_tz else "uncertain")
+
+
+def _koniec_wyr(skel, i):
+    """Koniec wyrażenia zaczynającego się w ``i`` (do ``;``/``,``/zamknięcia nawiasu; łańcuchy w kolejnych liniach)."""
+    depth = 0
+    n = len(skel)
+    j = i
+    while j < n:
+        ch = skel[j]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            if depth == 0:
+                return j
+            depth -= 1
+        elif depth == 0 and ch in ";,":
+            return j
+        elif ch == "\n" and depth == 0:
+            k = j + 1
+            while k < n and skel[k] in " \t\r\n":
+                k += 1
+            if not (k < n and skel[k] in ".?:+-*/|&%"):
+                return j
+        j += 1
+    return n
+
+
+def audyt_ts(backend, lokalne=(), systemowe=(), wykluczenia=(), files_from=None, ostrzez=None):
+    ostrzez = ostrzez or (lambda m: None)
+    raport = Raport()
+    lok, sys_ = pola_z_wpisow(lokalne), pola_z_wpisow(systemowe)
+    pliki = zbierz_pliki(backend, wykluczenia, files_from, ostrzez, ROZSZERZENIA_TS,
+                         DOMYSLNE_WYKLUCZENIA_TS, WZORCE_PLIKOW_TS)
+    for rel, fiz in pliki:
+        try:
+            tekst = czytaj_tekst(fiz)
+        except OSError as exc:
+            ostrzez("nie można odczytać %s: %s" % (rel, exc.__class__.__name__))
+            raport.pominiete.append(rel)
+            continue
+        try:
+            wyniki = AnalizatorTs(tekst, rel, lok, sys_).uruchom()
+        except Exception as exc:
+            ostrzez("pominięto %s: błąd analizy (%s)" % (rel, type(exc).__name__))
+            raport.pominiete.append(rel)
+            continue
+        raport.pliki.append(StatPliku(rel, 0, 0, len(wyniki)))
+        raport.wyniki.extend(wyniki)
+    raport.wyniki.sort(key=lambda w: (WAZNOSCI.index(w.waznosc), w.plik, w.linia, w.kategoria, w.fragment))
+    return raport
+
+
+def blokujacy_ts(w):
+    """W trybie ts blokują nowe wyniki o ważności wysokiej (wzorce 1, 6, 7 oraz 3 na wartości z 'Z')."""
+    return w.nowy and w.waznosc == "wysoka"
+
+
+def macierz_kodow(wyniki, kody):
+    """-> {kod: {waznosc: n, 'razem': n}} dla podanych kodów."""
+    m = OrderedDict((k, OrderedDict([(w, 0) for w in WAZNOSCI] + [("razem", 0)])) for k in kody)
+    for w in wyniki:
+        if w.kategoria in m:
+            m[w.kategoria][w.waznosc] += 1
+            m[w.kategoria]["razem"] += 1
+    return m
+
+
+def tekst_raportu_ts(raport):
+    nowe = sum(1 for w in raport.wyniki if w.nowy)
+    blok = sum(1 for w in raport.wyniki if blokujacy_ts(w))
+    out = ["sql-timezone-audit - raport (TypeScript/JavaScript)", "", "Podsumowanie", "------------",
+           "Przeanalizowane pliki: %d" % len(raport.pliki),
+           "Wyniki: %d (nowe: %d, znane z baseline: %d)" % (len(raport.wyniki), nowe, len(raport.wyniki) - nowe),
+           "Nowe wyniki blokujące - ważność wysoka (kod wyjścia 1): %d" % blok,
+           "", "Liczba znalezisk wg kodu i ważności:"]
+    macierz = macierz_kodow(raport.wyniki, KODY_TS)
+    szer = max(len(k) for k in KODY_TS)
+    out.append("  %-*s %7s %7s %5s %10s %6s" % (szer, "kod", "wysoka", "srednia", "niska", "informacja", "razem"))
+    suma = OrderedDict((w, 0) for w in WAZNOSCI + ("razem",))
+    for kod, wiersz in macierz.items():
+        out.append("  %-*s %7d %7d %5d %10d %6d" % ((szer, kod) + tuple(wiersz[w] for w in WAZNOSCI + ("razem",))))
+        for w in suma:
+            suma[w] += wiersz[w]
+    out.append("  %-*s %7d %7d %5d %10d %6d" % ((szer, "RAZEM") + tuple(suma[w] for w in WAZNOSCI + ("razem",))))
+    out += ["", "Najpierw napraw", "---------------"]
+    pilne = [w for w in raport.wyniki if w.nowy and w.waznosc == "wysoka" and w.pewnosc == "likely"]
+    if not pilne:
+        out.append("(brak nowych wyników o ważności wysokiej i pewności likely)")
+    for i, w in enumerate(pilne, 1):
+        opis = _opis_wyniku_ts(w)
+        out.append("%d. %s" % (i, opis[0]))
+        out += opis[1:]
+    out += ["", "Wyniki wg ważności", "------------------"]
+    for waz in WAZNOSCI:
+        grupa = [w for w in raport.wyniki if w.waznosc == waz]
+        out += ["", "%s (%d)" % (waz, len(grupa))]
+        for w in grupa:
+            out += _opis_wyniku_ts(w)
+    out += ["", "Rozkład per plik", "----------------"]
+    szer = max([len("plik")] + [len(p.plik) for p in raport.pliki])
+    out.append("%-*s  %6s" % (szer, "plik", "wyniki"))
+    for p in raport.pliki:
+        out.append("%-*s  %6d" % (szer, p.plik, p.wyniki))
+    return "\n".join(out) + "\n"
+
+
+def _opis_wyniku_ts(w, wciecie="    "):
+    znacznik = "" if w.nowy else " [znany]"
+    return ["%s:%d  [%s] %s/%s%s" % (w.plik, w.linia, w.kategoria, w.waznosc, w.pewnosc, znacznik),
+            "%skontekst: %s" % (wciecie, w.funkcja),
+            "%sfragment: %s" % (wciecie, w.fragment),
+            "%sdlaczego: %s" % (wciecie, w.dlaczego),
+            "%spodpowiedź: %s" % (wciecie, w.propozycja)]
+
+
+def json_raportu_ts(raport):
+    nowe = sum(1 for w in raport.wyniki if w.nowy)
+    macierz = macierz_kodow(raport.wyniki, KODY_TS)
+    waz = OrderedDict((w, sum(1 for x in raport.wyniki if x.waznosc == w)) for w in WAZNOSCI)
+    dane = OrderedDict([
+        ("wersja", WERSJA),
+        ("narzedzie", "sql_timezone_audit"),
+        ("tryb", "ts"),
+        ("podsumowanie", OrderedDict([
+            ("pliki", len(raport.pliki)),
+            ("wyniki", len(raport.wyniki)),
+            ("nowe", nowe),
+            ("znane", len(raport.wyniki) - nowe),
+            ("nowe_blokujace", sum(1 for w in raport.wyniki if blokujacy_ts(w))),
+            ("wg_waznosci", waz),
+            ("wg_kodu", macierz),
+        ])),
+        ("wyniki", [OrderedDict([
+            ("plik", w.plik), ("linia", w.linia), ("kod", w.kategoria), ("waznosc", w.waznosc),
+            ("pewnosc", w.pewnosc), ("kontekst", w.funkcja), ("fragment", w.fragment),
+            ("dlaczego", w.dlaczego), ("podpowiedz", w.propozycja), ("nowy", w.nowy)]) for w in raport.wyniki]),
+        ("pliki", [OrderedDict([("plik", p.plik), ("wyniki", p.wyniki)]) for p in raport.pliki]),
+    ])
+    return json.dumps(dane, ensure_ascii=False, indent=2) + "\n"
+
+
+def csv_raportu(raport, tryb):
+    """CSV (UTF-8, LF, separator przecinek) dla obu trybów."""
+    bufor = io.StringIO(newline="")
+    zapis = csv.writer(bufor, lineterminator="\n")
+    if tryb == "ts":
+        zapis.writerow(["plik", "linia", "kod", "waznosc", "pewnosc", "kontekst", "fragment", "podpowiedz",
+                        "dlaczego", "nowy"])
+        for w in raport.wyniki:
+            zapis.writerow([w.plik, w.linia, w.kategoria, w.waznosc, w.pewnosc, w.funkcja, w.fragment,
+                            w.propozycja, w.dlaczego, "tak" if w.nowy else "nie"])
+    else:
+        zapis.writerow(["plik", "linia", "kategoria", "waznosc", "pewnosc", "funkcja", "helper", "fragment",
+                        "dlaczego", "propozycja", "nowy"])
+        for w in raport.wyniki:
+            zapis.writerow([w.plik, w.linia, w.kategoria, w.waznosc, w.pewnosc, w.funkcja, w.helper,
+                            w.fragment, w.dlaczego, w.propozycja, "tak" if w.nowy else "nie"])
+    return bufor.getvalue()
+
+
 # --------------------------------------------------------------------------- CLI
 
 def _pisz(strumien, tekst):
@@ -1990,7 +3059,10 @@ def parser_argumentow():
     p = argparse.ArgumentParser(
         prog="sql_timezone_audit.py",
         description="Statyczny audyt błędów strefy czasowej i granicy doby (tylko raport).")
-    p.add_argument("--backend", required=True, help="katalog z kodem (rekurencyjnie *.py)")
+    p.add_argument("--backend", "--src", required=True, dest="backend",
+                   help="katalog z kodem (rekurencyjnie *.py; z --jezyk ts: *.ts, *.tsx, *.js, *.jsx)")
+    p.add_argument("--jezyk", choices=("py", "ts"), default="py",
+                   help="py (domyślnie): Python + SQL; ts: TypeScript/JavaScript/React (frontend)")
     p.add_argument("--tz-columns", help="plik z kolumnami systemowymi (UTC, timestamptz)")
     p.add_argument("--local-columns", help="plik z kolumnami lokalnymi (timestamp, czas ze ściany zegara)")
     p.add_argument("--baseline", help="baseline.json: wyniki z niego są traktowane jako znane")
@@ -1999,6 +3071,7 @@ def parser_argumentow():
     p.add_argument("--exclude", action="append", nargs="+", default=[], metavar="WZORZEC",
                    help="dodatkowe wzorce wykluczeń (fnmatch)")
     p.add_argument("--json", help="zapisz pełny raport maszynowy do pliku")
+    p.add_argument("--csv", help="zapisz wyniki jako CSV (UTF-8, LF) do pliku")
     return p
 
 
@@ -2027,7 +3100,11 @@ def main(argv=None, stdout=None, stderr=None):
     except (OSError, ValueError) as exc:
         return blad("nie można wczytać pliku wejściowego: %s" % exc)
     wykluczenia = [w for grupa in args.exclude for w in grupa]
-    raport = audyt(args.backend, KonfiguracjaKolumn(tz, lokalne), wykluczenia, files_from, ostrzez)
+    ts = args.jezyk == "ts"
+    if ts:
+        raport = audyt_ts(args.backend, lokalne, tz, wykluczenia, files_from, ostrzez)
+    else:
+        raport = audyt(args.backend, KonfiguracjaKolumn(tz, lokalne), wykluczenia, files_from, ostrzez)
     if baseline is not None:
         oznacz_nowe(raport.wyniki, baseline)
     try:
@@ -2035,10 +3112,14 @@ def main(argv=None, stdout=None, stderr=None):
             zapisz_baseline(args.write_baseline, raport.wyniki)
             oznacz_nowe(raport.wyniki, wczytaj_baseline(args.write_baseline))
         if args.json:
-            zapisz_plik(args.json, json_raportu(raport))
+            zapisz_plik(args.json, json_raportu_ts(raport) if ts else json_raportu(raport))
+        if args.csv:
+            zapisz_plik(args.csv, csv_raportu(raport, "ts" if ts else "py"))
     except OSError as exc:
         return blad("nie można zapisać pliku: %s" % exc)
-    _pisz(stdout, tekst_raportu(raport))
+    _pisz(stdout, tekst_raportu_ts(raport) if ts else tekst_raportu(raport))
+    if ts:
+        return 1 if any(blokujacy_ts(w) for w in raport.wyniki) else 0
     blokujace = [w for w in raport.wyniki if w.nowy and w.kategoria in KATEGORIE_BLOKUJACE]
     return 1 if blokujace else 0
 
