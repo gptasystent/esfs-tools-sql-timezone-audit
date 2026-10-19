@@ -144,7 +144,7 @@ Stan: zaimplementowane w jednym pliku `sql_timezone_audit.py` (Python 3.8+, wył
 ```
 python sql_timezone_audit.py --backend examples/backend \
     --tz-columns examples/tz_columns.txt --local-columns examples/local_columns.txt
-python -m unittest            # 258 testów, bez sieci i bez bazy (tests/ jest pakietem)
+python -m unittest            # 414 testów, bez sieci i bez bazy (tests/ jest pakietem)
 ```
 
 - Kod wyjścia: `0` brak nowych wyników blokujących, `1` co najmniej jeden **nowy** wynik z kategorii
@@ -302,3 +302,57 @@ Ograniczenia/fałszywe trafienia dopisane w rundzie 3:
 - "Parametr" to dowolny `.get(...)`/`[...]`, także zwykły słownik; wartość domyślna z takiego słownika też dostanie ważność średnią.
 - Kolumna numeru dla parametru SQL jest rozpoznawana dla całego zapytania, więc `SET order_no = %s, label = %s` z rokiem w `label` też da trafienie.
 - Źródło z SQL rozpoznawane tylko dla `SELECT` z `CURRENT_DATE`/`now()` przed pierwszym `FROM`; przez podzapytania/CTE nie.
+
+### Tryb frontendu: `--jezyk ts` (TypeScript / JavaScript / React)
+
+```
+python sql_timezone_audit.py --jezyk ts --backend src [--local-columns local.txt] [--tz-columns tz.txt] \
+    [--baseline b.json] [--write-baseline b.json] [--files-from lista.txt] [--exclude wzorzec ...] \
+    [--json raport.json] [--csv raport.csv]
+```
+
+Domyślnie (`--jezyk py`) nic się nie zmienia. `--src` jest aliasem `--backend`. Skanowane są `*.ts`, `*.tsx`, `*.js`, `*.jsx`;
+domyślnie pomijane: `node_modules`, `dist`, `build`, `.next`, `out`, `coverage`, `.git`, `.turbo`, `.cache`, `__tests__`, `__mocks__`,
+`tests`, `test`, `e2e`, `cypress` oraz pliki `*.test.*`, `*.spec.*`, `*.d.ts`, `*.min.js`, `*.stories.*`. Zero zależności: nie ma parsera TS,
+więc analiza to leksyker (komentarze, napisy, szablony `${}`, regexy) + wyrażenia regularne na "szkielecie" kodu + proste śledzenie zmiennych
+w obrębie zakresu funkcji. Pliki kolumn (`--local-columns`/`--tz-columns`, te same co dla SQL) służą tu jako lista **pól** (wpis `tabela.kolumna`
+liczy się jako nazwa pola; `starts_at` = `startsAt` = `startsat`): pole z `--local-columns` jest "lokalne" (`likely`), z `--tz-columns` "systemowe";
+bez plików działa heurystyka nazwy jak w SQL (`start*/end*/planned*/scheduled*/due*` → lokalne, `*At`, `*_at`, `timestamp`, `iso`, `utc` → timestamptz) i daje `uncertain`.
+
+Wyniki mają: `plik:linia`, kod, ważność, pewność, **kontekst** (`komponent Foo`, `hook useBar`, `klient API fetchX`, `funkcja x`, `metoda Klasa.m`, `moduł`;
+zagnieżdżone: `komponent Foo › handleSave`), fragment (maks. 120 znaków, wartości tekstowe zamaskowane), `dlaczego` i `podpowiedź` (wspólne helpery
+`dzisWarszawa()` / `formatujDateWarszawa()` / `poczatekDobyWarszawa()`). Komentarz `// tz-ok: powód` (lub `/* tz-ok: powód */`) wyłącza linię, w której stoi;
+komentarz sam w linii wyłącza tę linię i następną. Kod wyjścia: `1` gdy jest **nowy** wynik o ważności **wysokiej**, `0` w przeciwnym razie, `2` błąd użycia.
+Baseline działa jak w trybie py (klucz: plik + kontekst + kod + znormalizowany fragment).
+
+| Kod | Wzorzec | Ważność |
+|-----|---------|---------|
+| `ts_today_iso_slice` (1) | `new Date().toISOString().slice(0,10)` / `.split('T')[0]` / `.substring(0,10)` (też przez zmienną z "teraz" lub z `toISOString()`, oraz `new Date(r, m, d)` lokalna północ) | wysoka (odbiorca nieznany lub z API: średnia, `uncertain`) |
+| `ts_date_only_parse` (2) | `new Date('YYYY-MM-DD')`, `Date.parse('YYYY-MM-DD')`, szablon `${y}-${m}-${d}`, zmienna ze `slice(0,10)` | średnia (tylko do wyświetlenia: niska) |
+| `ts_locale_no_timezone` (3) | `toLocale(Date/Time)String`, `Intl.DateTimeFormat` bez `timeZone` | wysoka tylko dla wartości z `Z`/offsetem lub `toISOString()`; pole z nazwą timestamptz: średnia; pole typu date/lokalne: niska; `timeZone: 'UTC'` na timestamptz: średnia |
+| `ts_local_getter_on_utc` (4) | `getDate/getMonth/getFullYear/getHours/...` na obiekcie z ISO UTC (literał z `Z`, `toISOString()`, pole `*At`) | średnia |
+| `ts_string_date_compare` (5) | string `'YYYY-MM-DD'` (literał, zmienna, `slice(0,10)`) porównany z `Date`/`getTime()`/`Date.now()` | średnia |
+| `ts_now_into_local_field` (6) | `new Date()` / `Date.now()` / `.toISOString()` "teraz" w polu lokalnym (`{ startsAt: ... }`, `obj.dueDate = ...`, `setFieldValue('startsAt', ...)`) | wysoka |
+| `ts_startof_day_utc` (7) | `setHours(0,0,0,0)` / `setHours(23,59,59,999)` na dacie data-only/`Z`/`*At`; `setUTCHours(0,0,0,0)`; `dayjs.utc(..).startOf('day')`, `.utc().startOf('day')`, `moment('...Z').startOf('day')` | wysoka |
+| `ts_manual_hour_shift` (8) | `+ 2 * 3600 * 1000`, `- 1 * 60 * 60 * 1000`, `7200000`, `3_600_000`, `setHours(getHours() + 2)` | średnia (`likely`, gdy linia zawiera offset/utc/warsaw/tz/local) |
+
+Raport tekstowy ma macierz **liczby znalezisk wg kodu i ważności**; JSON (`"tryb": "ts"`) ma `podsumowanie.wg_kodu` (ważność × kod) i `wg_waznosci`;
+CSV (`--csv`, UTF-8, LF, przecinek; **nowe także dla trybu py**, bo wcześniej CSV nie istniał) ma kolumny `plik,linia,kod,waznosc,pewnosc,kontekst,fragment,podpowiedz,dlaczego,nowy`.
+Test jednostkowy: `tests/test_ts.py`, `tests/test_ts_cli.py`, golden `examples/EXPECTED_TS.md` dla fikcyjnego `examples/frontend`
+(odświeżenie: `UPDATE_GOLDEN=1 python -m unittest tests.test_ts_golden`).
+
+Decyzje i ograniczenia trybu ts:
+- **Redukcja szumu.** `toLocaleString` jest zgłaszane tylko dla odbiorcy, który wygląda na datę (liczby i tablice też je mają); odbiorca nieznany
+  daje najwyżej średnią `uncertain`; pole typu date i pole lokalne dają niską; `new Date(...)` z `'T..:..'` bez strefy oraz `new Date(r, m, d)` uznawane są za lokalne i pomijane.
+  Śledzenie zmiennych obejmuje przypisania w tym samym zakresie funkcji (lub zewnętrznym); parametry funkcji i właściwości obiektów są klasyfikowane tylko po nazwie.
+  Jedno trafienie na linię i kod. `Date.now() + N*3600*1000` jest pomijane, gdy linia wygląda na wygasanie/cache (`expir|ttl|timeout|delay|cache|debounce|interval|retry|maxAge|snooze|stale`).
+- **Brak parsera.** Fałszywe trafienia/negatywy są możliwe przy: apostrofach w tekście JSX (niedomknięty napis kończy się z końcem linii), regexach po `)`, makrach i
+  generykach TS w wyrażeniach porównań (`a < b > c`), wieloliniowych wyrażeniach z operatorami na początku linii, łańcuchach przez wiele wywołań pomocniczych.
+  Zakresy (kontekst) są rozpoznawane dla `function`, `const x = (..) =>` (także w `memo/forwardRef/useCallback`), klas i metod; funkcje anonimowe należą do zakresu nadrzędnego.
+- **Nie wykrywane:** `moment`/`dayjs`/`luxon`/`date-fns` poza `startOf('day')` (wzorzec 7); `Temporal`; daty przekazane do innych funkcji i formatowane gdzie indziej;
+  `toLocale*` wywołane na wyniku funkcji o nieznanym typie zwracanym; JSON z datami zdefiniowany poza kodem.
+- **Dwie ważności "wysoka" w innym sensie niż w py:** w trybie ts blokuje ważność (nie kategoria), więc wzorzec 3 na wartości bez `Z` nie psuje CI, a wzorzec 7 na polu `*At` z `uncertain` tak.
+- Tryb ts jest w tym samym pliku `sql_timezone_audit.py` (jeden plik do skopiowania na Windows); ścieżki, UTF-8/LF i BOM/CRLF w źródłach obsługiwane jak w trybie py.
+
+Otwarte pytania (ts): (1) czy wzorzec 7 na `*At` wyłącznie po nazwie powinien blokować CI; (2) czy `.mjs/.cjs` dołożyć do rozszerzeń; (3) czy `dzisWarszawa()` ma
+być nazwą wymuszaną przez narzędzie (obecnie to tylko podpowiedź w tekście); (4) czy wzorzec 1 na nieznanym odbiorcy (np. wartość z datepickera) ma być `wysoka`.
